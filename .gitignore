@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Tauri/Rust build output
+src-tauri/target/
+
+# Local app/runtime data
+.DS_Store
+*.log
+
+# Editor state
+.idea/
+.vscode/
+
+# Environment files
+.env
+.env.*
+
