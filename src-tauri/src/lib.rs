@@ -9,6 +9,7 @@ use std::process::Command;
 use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+const DEFAULT_CLASH_GROUP: &str = "Auto-Claude";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredProfile {
@@ -22,6 +23,15 @@ struct StoredProfile {
     settings_json: Option<Value>,
     keychain_password: Option<String>,
     meta: ProfileMeta,
+    #[serde(default)]
+    clash: Option<ProfileClashBinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProfileClashBinding {
+    enabled: bool,
+    group: String,
+    node: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -54,6 +64,7 @@ struct ProfileSummary {
     updated_at: DateTime<Utc>,
     last_switched_at: Option<DateTime<Utc>>,
     meta: ProfileMeta,
+    clash: Option<ProfileClashBinding>,
     is_current: bool,
 }
 
@@ -85,7 +96,33 @@ struct BackupResult {
 struct SwitchResult {
     switched_to: String,
     backup: BackupResult,
+    clash: Option<ClashSwitchResult>,
     restart_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClashStatus {
+    available: bool,
+    controller: String,
+    group: String,
+    group_type: Option<String>,
+    now: Option<String>,
+    nodes: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClashSwitchResult {
+    group: String,
+    node: String,
+    previous: Option<String>,
+    verified: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ClashRuntimeConfig {
+    controller: String,
+    secret: Option<String>,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -120,6 +157,19 @@ fn backups_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("backups"))
 }
 
+fn clash_verge_dir() -> Result<PathBuf, String> {
+    Ok(home_dir()?.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"))
+}
+
+fn clash_config_candidates() -> Result<Vec<PathBuf>, String> {
+    let base = clash_verge_dir()?;
+    Ok(vec![
+        base.join("config.yaml"),
+        base.join("clash-verge.yaml"),
+        base.join("clash-verge-check.yaml"),
+    ])
+}
+
 fn ensure_app_dirs() -> Result<(), String> {
     fs::create_dir_all(app_data_dir()?).map_err(|e| e.to_string())?;
     fs::create_dir_all(backups_dir()?).map_err(|e| e.to_string())?;
@@ -147,6 +197,16 @@ fn read_json_optional(path: PathBuf) -> Result<Option<Value>, String> {
     serde_json::from_str(&raw)
         .map(Some)
         .map_err(|e| format!("JSON 解析失败: {e}"))
+}
+
+fn read_yaml_optional(path: PathBuf) -> Result<Option<Value>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_yaml::from_str::<Value>(&raw)
+        .map(Some)
+        .map_err(|e| format!("YAML 解析失败: {e}"))
 }
 
 fn write_json_pretty(path: PathBuf, value: &Value) -> Result<(), String> {
@@ -235,6 +295,142 @@ fn read_keychain_password() -> Result<Option<String>, String> {
         return Ok(None);
     }
     Ok(None)
+}
+
+fn detect_clash_runtime_config() -> ClashRuntimeConfig {
+    for path in clash_config_candidates().unwrap_or_default() {
+        let Ok(Some(value)) = read_yaml_optional(path) else {
+            continue;
+        };
+        let controller = string_field(&value, &["external-controller"])
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "127.0.0.1:9090".to_string());
+        let controller = if controller.starts_with("http://") || controller.starts_with("https://")
+        {
+            controller
+        } else {
+            format!("http://{controller}")
+        };
+        let secret = string_field(&value, &["secret"])
+            .filter(|s| !s.trim().is_empty())
+            .map(ToOwned::to_owned);
+        return ClashRuntimeConfig { controller, secret };
+    }
+
+    ClashRuntimeConfig {
+        controller: "http://127.0.0.1:9090".to_string(),
+        secret: None,
+    }
+}
+
+fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    let cfg = detect_clash_runtime_config();
+    let url = format!(
+        "{}/{}",
+        cfg.controller.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    let mut cmd = Command::new("curl");
+    cmd.arg("-sS")
+        .arg("--max-time")
+        .arg("8")
+        .arg("-X")
+        .arg(method);
+    if let Some(secret) = cfg.secret {
+        cmd.arg("-H").arg(format!("Authorization: Bearer {secret}"));
+    }
+    if let Some(body) = body {
+        cmd.arg("-H")
+            .arg("Content-Type: application/json")
+            .arg("-d")
+            .arg(body.to_string());
+    }
+    cmd.arg(url);
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("调用 Clash 控制器失败: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "调用 Clash 控制器失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str(&stdout).map_err(|e| format!("Clash 返回 JSON 解析失败: {e}"))
+}
+
+fn clash_group_path(group: &str) -> String {
+    format!("/proxies/{}", urlencoding::encode(group))
+}
+
+fn read_clash_group(group: &str) -> Result<Value, String> {
+    clash_api("GET", &clash_group_path(group), None)
+}
+
+fn clash_status_for_group(group: &str) -> ClashStatus {
+    let runtime = detect_clash_runtime_config();
+    match read_clash_group(group) {
+        Ok(value) => ClashStatus {
+            available: true,
+            controller: runtime.controller,
+            group: group.to_string(),
+            group_type: string_field(&value, &["type"]).map(ToOwned::to_owned),
+            now: string_field(&value, &["now"]).map(ToOwned::to_owned),
+            nodes: value
+                .get("all")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            error: None,
+        },
+        Err(error) => ClashStatus {
+            available: false,
+            controller: runtime.controller,
+            group: group.to_string(),
+            group_type: None,
+            now: None,
+            nodes: Vec::new(),
+            error: Some(error),
+        },
+    }
+}
+
+fn switch_clash_node_internal(group: &str, node: &str) -> Result<ClashSwitchResult, String> {
+    let before = read_clash_group(group)?;
+    let previous = string_field(&before, &["now"]).map(ToOwned::to_owned);
+    let nodes = before
+        .get("all")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if !nodes.iter().any(|item| item == node) {
+        return Err(format!("节点「{node}」不在「{group}」组里"));
+    }
+
+    clash_api("PUT", &clash_group_path(group), Some(json!({ "name": node })))?;
+    let after = read_clash_group(group)?;
+    let now = string_field(&after, &["now"]).map(ToOwned::to_owned);
+    Ok(ClashSwitchResult {
+        group: group.to_string(),
+        node: node.to_string(),
+        previous,
+        verified: now.as_deref() == Some(node),
+    })
 }
 
 fn write_keychain_password(password: &str) -> Result<(), String> {
@@ -355,6 +551,7 @@ fn list_profiles() -> Result<Vec<ProfileSummary>, String> {
             updated_at: p.updated_at,
             last_switched_at: p.last_switched_at,
             meta: p.meta.clone(),
+            clash: p.clash.clone(),
             is_current: store.current_profile_id.as_deref() == Some(&p.id),
         })
         .collect())
@@ -386,6 +583,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         claude_json,
         settings_json,
         keychain_password,
+        clash: None,
     };
     let summary = ProfileSummary {
         id: profile.id.clone(),
@@ -395,6 +593,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         updated_at: profile.updated_at,
         last_switched_at: profile.last_switched_at,
         meta: profile.meta.clone(),
+        clash: profile.clash.clone(),
         is_current: false,
     };
     store.profiles.push(profile);
@@ -436,6 +635,16 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     let profile = store.profiles[idx].clone();
     let backup = create_backup_with_label(&format!("before-switch-to-{}", profile.name))?;
 
+    let clash_result = if let Some(binding) = &profile.clash {
+        if binding.enabled {
+            Some(switch_clash_node_internal(&binding.group, &binding.node)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let current_claude_json = read_json_optional(claude_json_path()?)?;
     let next_claude_json = merge_claude_json(current_claude_json, &profile.claude_json);
     write_json_pretty(claude_json_path()?, &next_claude_json)?;
@@ -455,8 +664,71 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     Ok(SwitchResult {
         switched_to: profile.name,
         backup,
+        clash: clash_result,
         restart_hint: "切换已写入磁盘和 Keychain；请重启正在运行的 Claude Code 会话。".to_string(),
     })
+}
+
+#[tauri::command]
+fn get_clash_status() -> Result<ClashStatus, String> {
+    Ok(clash_status_for_group(DEFAULT_CLASH_GROUP))
+}
+
+#[tauri::command]
+fn switch_clash_node(group: String, node: String) -> Result<ClashSwitchResult, String> {
+    switch_clash_node_internal(group.trim(), node.trim())
+}
+
+#[tauri::command]
+fn switch_profile_clash_node(id: String) -> Result<ClashSwitchResult, String> {
+    let store = load_store()?;
+    let profile = store
+        .profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "找不到这个账号快照".to_string())?;
+    let binding = profile
+        .clash
+        .as_ref()
+        .ok_or_else(|| "这个账号还没有绑定 Clash 节点".to_string())?;
+    if !binding.enabled {
+        return Err("这个账号的 Clash 绑定未启用".to_string());
+    }
+    switch_clash_node_internal(&binding.group, &binding.node)
+}
+
+#[tauri::command]
+fn set_profile_clash_binding(
+    id: String,
+    enabled: bool,
+    group: String,
+    node: String,
+) -> Result<(), String> {
+    let mut store = load_store()?;
+    let profile = store
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "找不到这个账号快照".to_string())?;
+    let group = group.trim();
+    let node = node.trim();
+    if enabled {
+        if group.is_empty() {
+            return Err("Clash 组不能为空".to_string());
+        }
+        if node.is_empty() {
+            return Err("Clash 节点不能为空".to_string());
+        }
+        profile.clash = Some(ProfileClashBinding {
+            enabled,
+            group: group.to_string(),
+            node: node.to_string(),
+        });
+    } else {
+        profile.clash = None;
+    }
+    profile.updated_at = Utc::now();
+    save_store(&store)
 }
 
 #[tauri::command]
@@ -535,6 +807,10 @@ pub fn run() {
             list_profiles,
             capture_current_profile,
             switch_profile,
+            get_clash_status,
+            switch_clash_node,
+            switch_profile_clash_node,
+            set_profile_clash_binding,
             delete_profile,
             rename_profile,
             create_backup,

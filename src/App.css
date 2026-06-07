@@ -23,7 +23,8 @@ body {
 
 button,
 input,
-textarea {
+textarea,
+select {
   font: inherit;
 }
 
@@ -275,7 +276,8 @@ label {
 }
 
 input,
-textarea {
+textarea,
+select {
   width: 100%;
   color: #262722;
   background: #fffaf0;
@@ -290,7 +292,8 @@ textarea {
 }
 
 input:focus,
-textarea:focus {
+textarea:focus,
+select:focus {
   border-color: #2f5d50;
   box-shadow: 0 0 0 3px rgba(47, 93, 80, 0.14);
 }
@@ -305,24 +308,53 @@ textarea:focus {
   min-height: 166px;
 }
 
-.locked {
+.clash-summary {
   display: grid;
-  gap: 9px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
   margin-top: 18px;
-  padding: 16px;
-  border-radius: 6px;
-  color: #645c4f;
-  background: repeating-linear-gradient(
-    135deg,
-    #eee4d3,
-    #eee4d3 10px,
-    #e8ddca 10px,
-    #e8ddca 20px
-  );
+  margin-bottom: 14px;
 }
 
-.locked strong {
+.clash-summary div {
+  display: grid;
+  gap: 6px;
+  padding: 16px;
+  border-radius: 6px;
+  background: #eee7d8;
+}
+
+.clash-summary span {
+  color: #756c5b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.clash-summary strong {
+  overflow: hidden;
   color: #24251f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inline-warning,
+.inline-error {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+.inline-warning {
+  color: #7a3a1a;
+  background: #efdcc6;
+}
+
+.inline-error {
+  color: #6e221f;
+  background: #f1d7cf;
 }
 
 .path-list {
@@ -450,6 +482,16 @@ code {
   min-height: 42px;
   margin: 0;
   line-height: 1.45;
+}
+
+.node-bind {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.node-bind select {
+  min-height: 42px;
 }
 
 .profile-actions {

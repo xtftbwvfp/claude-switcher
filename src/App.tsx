@@ -13,6 +13,7 @@ import {
   Network,
   Plus,
   RefreshCw,
+  Router,
   ShieldAlert,
   Trash2,
   UserRound,
@@ -40,7 +41,14 @@ interface ProfileSummary {
   updated_at: string;
   last_switched_at?: string | null;
   meta: ProfileMeta;
+  clash?: ProfileClashBinding | null;
   is_current: boolean;
+}
+
+interface ProfileClashBinding {
+  enabled: boolean;
+  group: string;
+  node: string;
 }
 
 interface ClaudeStatus {
@@ -68,10 +76,28 @@ interface BackupResult {
 interface SwitchResult {
   switched_to: string;
   backup: BackupResult;
+  clash?: ClashSwitchResult | null;
   restart_hint: string;
 }
 
-type BusyAction = 'refresh' | 'capture' | 'switch' | 'backup' | 'delete' | null;
+interface ClashStatus {
+  available: boolean;
+  controller: string;
+  group: string;
+  group_type?: string | null;
+  now?: string | null;
+  nodes: string[];
+  error?: string | null;
+}
+
+interface ClashSwitchResult {
+  group: string;
+  node: string;
+  previous?: string | null;
+  verified: boolean;
+}
+
+type BusyAction = 'refresh' | 'capture' | 'switch' | 'backup' | 'delete' | 'bind' | 'clash' | null;
 
 const fmt = new Intl.DateTimeFormat('zh-CN', {
   month: '2-digit',
@@ -115,6 +141,7 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyAction>('refresh');
+  const [clashStatus, setClashStatus] = useState<ClashStatus | null>(null);
 
   const currentProfile = useMemo(
     () => profiles.find((profile) => profile.is_current) || null,
@@ -129,8 +156,16 @@ function App() {
         invoke<ClaudeStatus>('get_status'),
         invoke<ProfileSummary[]>('list_profiles'),
       ]);
+      const nextClashStatus = await invoke<ClashStatus>('get_clash_status').catch((err) => ({
+        available: false,
+        controller: 'http://127.0.0.1:9090',
+        group: 'Auto-Claude',
+        nodes: [],
+        error: String(err),
+      }));
       setStatus(nextStatus);
       setProfiles(nextProfiles);
+      setClashStatus(nextClashStatus);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -170,7 +205,10 @@ function App() {
   const switchTo = (id: string) =>
     run('switch', async () => {
       const result = await invoke<SwitchResult>('switch_profile', { id });
-      return `${result.switched_to} 已切换；${result.restart_hint}`;
+      const clash = result.clash
+        ? `Auto-Claude 已切到 ${result.clash.node}；`
+        : '';
+      return `${result.switched_to} 已切换；${clash}${result.restart_hint}`;
     });
 
   const backup = () =>
@@ -186,6 +224,25 @@ function App() {
       return '账号快照已删除';
     });
   };
+
+  const bindNode = (id: string, node: string) =>
+    run('bind', async () => {
+      await invoke('set_profile_clash_binding', {
+        id,
+        enabled: node.length > 0,
+        group: 'Auto-Claude',
+        node,
+      });
+      return node ? `已绑定 Auto-Claude -> ${node}` : '已清除这个账号的节点绑定';
+    });
+
+  const testProfileNode = (id: string) =>
+    run('clash', async () => {
+      const result = await invoke<ClashSwitchResult>('switch_profile_clash_node', { id });
+      return result.verified
+        ? `Auto-Claude 已切到 ${result.node}`
+        : `已请求切到 ${result.node}，但 Clash 当前状态未确认`;
+    });
 
   const openDataDir = () =>
     run(null, async () => {
@@ -290,10 +347,32 @@ function App() {
             <Network />
             <span>网络节点</span>
           </div>
-          <div className="locked">
-            <strong>本版未启用 IP / Clash 绑定</strong>
-            <span>当前只切换 Claude Code 本机账号状态。后续可以把 profile 和 Auto-Claude 节点做一对一映射。</span>
+          <div className="clash-summary">
+            <div>
+              <span>控制器</span>
+              <strong>{clashStatus?.controller || '未连接'}</strong>
+            </div>
+            <div>
+              <span>组</span>
+              <strong>{clashStatus?.group || 'Auto-Claude'}</strong>
+            </div>
+            <div>
+              <span>当前节点</span>
+              <strong>{clashStatus?.now || '未读取'}</strong>
+            </div>
+            <div>
+              <span>组类型</span>
+              <strong>{clashStatus?.group_type || '未知'}</strong>
+            </div>
           </div>
+          {clashStatus?.error && <div className="inline-error">{clashStatus.error}</div>}
+          {clashStatus?.group_type && clashStatus.group_type !== 'Selector' && (
+            <div className="inline-warning">Auto-Claude 不是 select 组，固定账号节点可能被自动测速覆盖。</div>
+          )}
+          <button className="ghost wide" onClick={() => load()} disabled={!!busy}>
+            <RefreshCw />
+            刷新 Clash 状态
+          </button>
         </div>
 
         <div className="panel files-panel">
@@ -348,6 +427,31 @@ function App() {
                     <Clock />
                     {dateLabel(profile.last_switched_at)}
                   </span>
+                  <span>
+                    <Router />
+                    {profile.clash?.enabled ? profile.clash.node : '节点未绑定'}
+                  </span>
+                </div>
+                <div className="node-bind">
+                  <select
+                    value={profile.clash?.enabled ? profile.clash.node : ''}
+                    onChange={(event) => bindNode(profile.id, event.target.value)}
+                    disabled={!!busy || !clashStatus?.nodes.length}
+                  >
+                    <option value="">不自动切节点</option>
+                    {clashStatus?.nodes.map((node) => (
+                      <option key={node} value={node}>
+                        {node}
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="ghost"
+                    onClick={() => testProfileNode(profile.id)}
+                    disabled={!!busy || !profile.clash?.enabled}
+                  >
+                    测节点
+                  </button>
                 </div>
                 {profile.notes && <p>{profile.notes}</p>}
                 <div className="profile-actions">
