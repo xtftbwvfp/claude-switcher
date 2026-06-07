@@ -12,6 +12,10 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration as StdDuration;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+use tauri::Manager;
 use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -657,6 +661,84 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
         top_model,
         warnings,
     })
+}
+
+fn compact_token_count(value: u64) -> String {
+    if value >= 1_000_000_000 {
+        let scaled = value as f64 / 1_000_000_000.0;
+        if value >= 10_000_000_000 {
+            format!("{scaled:.0}B")
+        } else {
+            format!("{scaled:.1}B")
+        }
+    } else if value >= 1_000_000 {
+        let scaled = value as f64 / 1_000_000.0;
+        if value >= 10_000_000 {
+            format!("{scaled:.0}M")
+        } else {
+            format!("{scaled:.1}M")
+        }
+    } else if value >= 1_000 {
+        let scaled = value as f64 / 1_000.0;
+        if value >= 10_000 {
+            format!("{scaled:.0}K")
+        } else {
+            format!("{scaled:.1}K")
+        }
+    } else {
+        value.to_string()
+    }
+}
+
+fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(tray) = app.tray_by_id("main") else {
+        return Ok(());
+    };
+    let usage = claude_usage_snapshot()?;
+    let session = compact_token_count(usage.session.totals.total_tokens);
+    let weekly = compact_token_count(usage.weekly.totals.total_tokens);
+    let model = usage.top_model.as_deref().unwrap_or("暂无");
+    let latest = usage
+        .latest_message_at
+        .map(|value| value.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "无记录".to_string());
+    let title = format!("Claude 5h {session}");
+    let tooltip = format!(
+        "Claude Switcher\n近 5 小时: {session} token\n近 7 天: {weekly} token\n常用模型: {model}\n最近记录: {latest}"
+    );
+    tray.set_title(Some(title))
+        .map_err(|e| format!("更新菜单栏标题失败: {e}"))?;
+    tray.set_tooltip(Some(tooltip))
+        .map_err(|e| format!("更新菜单栏提示失败: {e}"))?;
+    Ok(())
+}
+
+fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
+    let app_handle = app.handle().clone();
+    let _ = refresh_tray_status(&app_handle);
+
+    let refresh_handle = app_handle.clone();
+    thread::spawn(move || loop {
+        thread::sleep(StdDuration::from_secs(300));
+        let _ = refresh_tray_status(&refresh_handle);
+    });
+
+    app.on_tray_icon_event(|app, event| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }
+    });
+
+    Ok(())
 }
 
 fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) -> ProfileMeta {
@@ -2283,6 +2365,12 @@ fn inspect_local_files() -> Result<BTreeMap<String, bool>, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            if let Err(error) = install_tray_handlers(app) {
+                eprintln!("[claude-switcher] 初始化菜单栏状态失败: {error}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_telemetry_mode,

@@ -19,6 +19,14 @@
         "minHeight": 680
       }
     ],
+    "trayIcon": {
+      "id": "main",
+      "iconPath": "icons/32x32.png",
+      "iconAsTemplate": true,
+      "showMenuOnLeftClick": false,
+      "title": "Claude",
+      "tooltip": "Claude Switcher"
+    },
     "security": {
       "csp": null
     }
