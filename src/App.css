@@ -512,6 +512,70 @@ code {
   }
 }
 
+.telemetry-intro {
+  margin: 14px 0 16px;
+  color: #736b60;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.telemetry-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.telemetry-options button {
+  flex: 1 1 0;
+  min-width: 120px;
+}
+
+.telemetry-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  margin-left: 6px;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 850;
+  color: #17463b;
+  background: rgba(23, 70, 59, 0.16);
+}
+
+.primary .telemetry-badge {
+  color: #f8f0dc;
+  background: rgba(248, 240, 220, 0.24);
+}
+
+.telemetry-desc {
+  display: grid;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.telemetry-desc p {
+  margin: 0;
+  padding: 9px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #8a8275;
+  background: rgba(250, 247, 237, 0.5);
+  border: 1px solid transparent;
+}
+
+.telemetry-desc p.active {
+  color: #4a463d;
+  background: rgba(47, 93, 80, 0.08);
+  border-color: rgba(47, 93, 80, 0.22);
+}
+
+.telemetry-desc strong {
+  margin-right: 8px;
+  color: #24251f;
+}
+
 @media (max-width: 980px) {
   body {
     min-width: 0;

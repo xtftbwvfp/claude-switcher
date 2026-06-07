@@ -1,4 +1,9 @@
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use chrono::{DateTime, Utc};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -9,12 +14,30 @@ use std::process::Command;
 use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+// 早期 claude-switcher 误把 account 写成了 "Claude Code"，切号时顺手清理残留。
+const LEGACY_KEYCHAIN_ACCOUNT: &str = "Claude Code";
+// C2：store/备份里 keychain_password 落盘加密用的主密钥（32B AES-256），
+// 单独存一个 Keychain 项里（service 固定，account=当前系统用户名）。
+const STORE_KEY_KEYCHAIN_SERVICE: &str = "claude-switcher-store-key";
+// C2：加密值前缀。格式为 "enc:v1:" + base64(nonce(12B) || ciphertext)。
+// 不以此前缀开头的值一律当作旧明文（向后兼容），下次落盘时会被自动加密。
+const ENC_PREFIX: &str = "enc:v1:";
 const DEFAULT_CLASH_GROUP: &str = "Auto-Claude";
+// 遥测去关联：注入进 ~/.claude/settings.json 的 "env" 的两个隐私开关 key（互斥）。
+// - DISABLE_TELEMETRY=1：关掉 Claude Code 的遥测上报（推荐，副作用最小）。
+// - CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1：连同所有非必要网络一起关
+//   （最强，副作用：手动更新滞后 / 新模型滞后 / 无 bridge 注册）。
+const ENV_DISABLE_TELEMETRY: &str = "DISABLE_TELEMETRY";
+const ENV_DISABLE_NONESSENTIAL_TRAFFIC: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+// 真实会让 Keychain OAuth 切号失效的环境变量。
+// 注意：不存在 CLAUDE_CODE_API_KEY_HELPER 这个 env（apiKeyHelper 只在 settings.json 里），
+// 这里补上 codex 逆向确认的两个 file-descriptor 变量。
 const AUTH_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_API_KEY_HELPER",
+    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,10 +78,54 @@ struct ProfileMeta {
     rate_limit_tier: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// 遥测去关联模式（三态，前后端契约里序列化成 camelCase 字符串）：
+/// - `Default`         → 不注入任何隐私 env（关掉去关联）。
+/// - `DisableTelemetry`→ settings.env 注入 DISABLE_TELEMETRY=1（**默认值**，推荐）。
+/// - `EssentialOnly`   → settings.env 注入 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+///   （最强，副作用：手动更新 / 新模型滞后、无 bridge 注册）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum TelemetryMode {
+    Default,
+    DisableTelemetry,
+    EssentialOnly,
+}
+
+impl TelemetryMode {
+    /// 该模式要注入 settings.env 的隐私 env key（`Default` 不注入返回 `None`）。
+    fn env_key(self) -> Option<&'static str> {
+        match self {
+            TelemetryMode::Default => None,
+            TelemetryMode::DisableTelemetry => Some(ENV_DISABLE_TELEMETRY),
+            TelemetryMode::EssentialOnly => Some(ENV_DISABLE_NONESSENTIAL_TRAFFIC),
+        }
+    }
+}
+
+/// 老 store 缺字段 / 全新安装时的默认遥测模式 = DisableTelemetry（默认开启去关联）。
+fn default_telemetry_mode() -> TelemetryMode {
+    TelemetryMode::DisableTelemetry
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Store {
     profiles: Vec<StoredProfile>,
     current_profile_id: Option<String>,
+    // 缺省 = DisableTelemetry：老 store 没这个字段、新装都默认开启去关联。
+    #[serde(default = "default_telemetry_mode")]
+    telemetry_mode: TelemetryMode,
+}
+
+// 不能用 #[derive(Default)]：那会让 telemetry_mode = TelemetryMode 的派生默认值，
+// 而我们要的默认是 DisableTelemetry。手写 Default 保证「全新空 store」也默认开启去关联。
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            profiles: Vec::new(),
+            current_profile_id: None,
+            telemetry_mode: default_telemetry_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +155,8 @@ struct ClaudeStatus {
     backup_dir: String,
     profile_count: usize,
     current_profile_id: Option<String>,
+    // 当前遥测去关联模式（"default"/"disableTelemetry"/"essentialOnly"）。
+    telemetry_mode: TelemetryMode,
     warnings: Vec<String>,
 }
 
@@ -99,11 +168,28 @@ struct BackupResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct BackupSummary {
+    id: String,
+    label: String,
+    // ISO 字符串（chrono 默认 Serialize 即 RFC3339 ISO 格式）。
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct SwitchResult {
     switched_to: String,
     backup: BackupResult,
     clash: Option<ClashSwitchResult>,
     restart_hint: String,
+    // 非阻断告警：例如身份不匹配跳过回写、Claude Code 仍在运行需重启等。
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreResult {
+    restored_from: String,
+    backup: BackupResult,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -231,13 +317,40 @@ fn load_store() -> Result<Store, String> {
         return Ok(Store::default());
     }
     let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&raw).map_err(|e| format!("store.private.json 解析失败: {e}"))
+    let mut store: Store =
+        serde_json::from_str(&raw).map_err(|e| format!("store.private.json 解析失败: {e}"))?;
+
+    // C2：解密每个 profile 的 keychain_password。
+    // 旧明文（不以 "enc:v1:" 开头）由 decrypt_secret 原样返回；解密失败返回清晰错误。
+    for profile in &mut store.profiles {
+        if let Some(enc) = profile.keychain_password.take() {
+            let plain = decrypt_secret(&enc).map_err(|e| {
+                format!("解密账号「{}」的 Keychain 凭据失败: {e}", profile.name)
+            })?;
+            profile.keychain_password = Some(plain);
+        }
+    }
+    Ok(store)
 }
 
 fn save_store(store: &Store) -> Result<(), String> {
     ensure_app_dirs()?;
     let path = store_path()?;
-    let raw = serde_json::to_string_pretty(store).map_err(|e| e.to_string())?;
+
+    // C2：落盘前把每个 profile 的明文 keychain_password 加密成 "enc:v1:..."。
+    // 在 store 的 clone 上加密，不污染内存里调用方持有的明文，方便后续逻辑继续用。
+    // 升级后首次 save_store 会把已有明文 store 一并迁移成加密。
+    let mut to_persist = store.clone();
+    for profile in &mut to_persist.profiles {
+        if let Some(plain) = profile.keychain_password.take() {
+            let enc = encrypt_keychain_field(&plain).map_err(|e| {
+                format!("加密账号「{}」的 Keychain 凭据失败: {e}", profile.name)
+            })?;
+            profile.keychain_password = Some(enc);
+        }
+    }
+
+    let raw = serde_json::to_string_pretty(&to_persist).map_err(|e| e.to_string())?;
     fs::write(&path, format!("{raw}\n")).map_err(|e| e.to_string())?;
     chmod_600(&path)
 }
@@ -285,21 +398,26 @@ fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) ->
     meta
 }
 
-fn current_username() -> String {
-    std::env::var("USER").unwrap_or_else(|_| {
-        Command::new("whoami")
-            .output()
-            .ok()
-            .and_then(|output| {
-                if output.status.success() {
-                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-                } else {
-                    None
-                }
-            })
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "xiaojian".to_string())
-    })
+fn current_username() -> Result<String, String> {
+    if let Ok(name) = std::env::var("USER") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+    // $USER 不可用时退回 whoami；两者都失败就报错，绝不写死某个用户名。
+    let whoami = Command::new("whoami")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .filter(|name| !name.is_empty());
+    whoami.ok_or_else(|| "无法确定当前系统用户名（$USER 与 whoami 均失败）".to_string())
 }
 
 fn hex_encode(input: &str) -> String {
@@ -311,7 +429,7 @@ fn hex_encode(input: &str) -> String {
 }
 
 fn read_keychain_password() -> Result<Option<String>, String> {
-    let username = current_username();
+    let username = current_username()?;
     let output = Command::new("security")
         .arg("find-generic-password")
         .arg("-a")
@@ -343,6 +461,144 @@ fn read_keychain_password() -> Result<Option<String>, String> {
         return Ok(None);
     }
     Ok(None)
+}
+
+// ───────────────────────── C2：token 落盘加密 ─────────────────────────
+//
+// 设计要点：
+// - 只加密「敏感字段」keychain_password（OAuth blob，唯一明文 token）；
+//   claude_json / settings_json / meta 保持明文，方便调试。
+// - 主密钥 32B 存独立 Keychain 项（service=STORE_KEY_KEYCHAIN_SERVICE，
+//   account=当前系统用户名），缺失时用 rand 生成并 base64 写入 keychain。
+// - 加密值表示：字符串 "enc:v1:" + base64(nonce(12B) || ciphertext)。
+// - 向后兼容：读到的值若不以 ENC_PREFIX 开头 → 当旧明文直接用，下次 save 自然被加密。
+// - nonce 每次写入都用 OsRng 重新随机生成 12B，绝不复用（GCM 安全前提）。
+
+/// 读取（缺失则生成并写入）store 加密主密钥，返回 32 字节。
+///
+/// Keychain 里以 base64 字符串保存。失败一律返回清晰 Err（不 panic）。
+/// 只读取现有 store 加密主密钥：不存在返回 Ok(None)，真正出错返回 Err。
+///
+/// **解密路径只用这个**——绝不在缺密钥时生成新密钥。否则一旦主密钥临时读不到/
+/// 丢失，就会铸出新密钥、用错密钥解密、并污染恢复路径，导致已加密数据不可逆丢失。
+fn read_store_key() -> Result<Option<[u8; 32]>, String> {
+    let username = current_username()?;
+    let output = Command::new("security")
+        .arg("find-generic-password")
+        .arg("-a")
+        .arg(&username)
+        .arg("-s")
+        .arg(STORE_KEY_KEYCHAIN_SERVICE)
+        .arg("-w")
+        .output()
+        .map_err(|e| format!("读取 store 加密密钥失败: {e}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let bytes = BASE64
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("store 加密密钥 base64 解码失败: {e}"))?;
+    let key: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "store 加密密钥长度异常（应为 32 字节）".to_string())?;
+    Ok(Some(key))
+}
+
+/// **加密路径专用**：读现有密钥，缺失才用 OsRng 生成 32B 新密钥并 base64 写入 keychain。
+/// 生成密钥这个副作用只允许发生在「加密新明文」时，不允许发生在解密时。
+fn load_or_create_store_key() -> Result<[u8; 32], String> {
+    if let Some(key) = read_store_key()? {
+        return Ok(key);
+    }
+
+    let username = current_username()?;
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    let b64 = BASE64.encode(key);
+
+    let write = Command::new("security")
+        .arg("add-generic-password")
+        .arg("-U")
+        .arg("-a")
+        .arg(&username)
+        .arg("-s")
+        .arg(STORE_KEY_KEYCHAIN_SERVICE)
+        .arg("-w")
+        .arg(&b64)
+        .output()
+        .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
+    if !write.status.success() {
+        return Err(format!(
+            "写入 store 加密密钥失败: {}",
+            String::from_utf8_lossy(&write.stderr)
+        ));
+    }
+    Ok(key)
+}
+
+/// 把明文加密成 "enc:v1:" + base64(nonce(12B) || ciphertext)。
+fn encrypt_secret(plaintext: &str) -> Result<String, String> {
+    let key_bytes = load_or_create_store_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+
+    // 每次写入都重新随机生成 12B nonce，绝不复用。
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|e| format!("加密 token 失败: {e}"))?;
+
+    let mut blob = Vec::with_capacity(12 + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    Ok(format!("{ENC_PREFIX}{}", BASE64.encode(blob)))
+}
+
+/// 解密 "enc:v1:..." 字符串回明文。
+/// 若不以 ENC_PREFIX 开头 → 当旧明文原样返回（向后兼容）。
+/// 解密失败返回清晰 Err（不 panic）。
+fn decrypt_secret(value: &str) -> Result<String, String> {
+    let Some(b64) = value.strip_prefix(ENC_PREFIX) else {
+        // 旧明文：原样返回，下次落盘时会被自动加密。
+        return Ok(value.to_string());
+    };
+
+    let blob = BASE64
+        .decode(b64.as_bytes())
+        .map_err(|e| format!("解密 token 失败（base64 解码）: {e}"))?;
+    if blob.len() < 12 {
+        return Err("解密 token 失败：密文长度不足（缺少 nonce）".to_string());
+    }
+    let (nonce_bytes, ciphertext) = blob.split_at(12);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    // 解密只读现有密钥，缺失即明确报错——绝不在这里生成新密钥（否则会用错密钥
+    // 解密并污染数据）。
+    let key_bytes = read_store_key()?.ok_or_else(|| {
+        "解密 token 失败：找不到 store 加密主密钥（claude-switcher-store-key）。\
+         可能密钥被删除 / 换机 / 系统用户名变化，已加密数据无法解开。\
+         请勿在此状态下覆盖保存 store，先恢复该 Keychain 密钥项。"
+            .to_string()
+    })?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key_bytes));
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|e| format!("解密 token 失败（认证/解密错误，密钥不匹配或数据被篡改）: {e}"))?;
+    String::from_utf8(plaintext).map_err(|e| format!("解密 token 失败（非 UTF-8 明文）: {e}"))
+}
+
+/// 把一个可能为明文的 keychain_password 落盘前加密。
+/// 已经是 "enc:v1:" 开头的（不应发生，但保险）直接透传，避免二次加密。
+fn encrypt_keychain_field(value: &str) -> Result<String, String> {
+    if value.starts_with(ENC_PREFIX) {
+        return Ok(value.to_string());
+    }
+    encrypt_secret(value)
 }
 
 fn detect_clash_runtime_config() -> ClashRuntimeConfig {
@@ -482,10 +738,15 @@ fn switch_clash_node_internal(group: &str, node: &str) -> Result<ClashSwitchResu
 }
 
 fn write_keychain_password(password: &str) -> Result<(), String> {
-    let username = current_username();
+    let username = current_username()?;
+
+    // 只清理 *当前用户* 名下的同名 service 项，避免误删其他 account（如别的系统用户）
+    // 写在同一 service 上的钥匙串条目。
     loop {
         let output = Command::new("security")
-            .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE])
+            .args(["delete-generic-password", "-a"])
+            .arg(&username)
+            .args(["-s", KEYCHAIN_SERVICE])
             .output()
             .map_err(|e| format!("清理旧 Keychain 失败: {e}"))?;
         if !output.status.success() {
@@ -493,11 +754,23 @@ fn write_keychain_password(password: &str) -> Result<(), String> {
         }
     }
 
+    // best-effort 清理早期 claude-switcher 误用 account="Claude Code" 写下的残留项。
+    loop {
+        let output = Command::new("security")
+            .args(["delete-generic-password", "-a", LEGACY_KEYCHAIN_ACCOUNT])
+            .args(["-s", KEYCHAIN_SERVICE])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => continue,
+            _ => break,
+        }
+    }
+
     let output = Command::new("security")
         .arg("add-generic-password")
         .arg("-U")
         .arg("-a")
-        .arg(username)
+        .arg(&username)
         .arg("-s")
         .arg(KEYCHAIN_SERVICE)
         .arg("-X")
@@ -515,50 +788,413 @@ fn write_keychain_password(password: &str) -> Result<(), String> {
     }
 }
 
-fn current_snapshot() -> Result<(Option<Value>, Option<Value>, Option<String>), String> {
+/// live 快照三元组：(~/.claude.json, ~/.claude/settings.json, Keychain 凭据)。
+/// 抽别名消掉 clippy::type_complexity，并让 BackupSnapshot / 各处签名读起来一致。
+type LiveSnapshot = (Option<Value>, Option<Value>, Option<String>);
+
+fn current_snapshot() -> Result<LiveSnapshot, String> {
     let claude_json = read_json_optional(claude_json_path()?)?;
     let settings_json = read_json_optional(claude_settings_path()?)?;
     let keychain = read_keychain_password()?;
     Ok((claude_json, settings_json, keychain))
 }
 
-fn update_profile_from_snapshot(
-    profile: &mut StoredProfile,
-    claude_json: Option<Value>,
-    settings_json: Option<Value>,
-    keychain_password: Option<String>,
-) -> Result<(), String> {
-    let claude_json =
-        claude_json.ok_or_else(|| "当前没有 ~/.claude.json，无法回写当前账号快照".to_string())?;
-    if keychain_password.is_none() {
-        return Err("当前没有 Keychain Claude Code-credentials，无法回写当前账号快照".to_string());
+/// 清空当前用户名下的 Keychain 凭据条目（回滚到「原本没有钥匙串」时用）。
+/// best-effort：删不掉/本来就没有都当成成功，不要让回滚因为这步炸掉。
+fn clear_keychain_password() -> Result<(), String> {
+    let username = current_username()?;
+    loop {
+        let output = Command::new("security")
+            .args(["delete-generic-password", "-a"])
+            .arg(&username)
+            .args(["-s", KEYCHAIN_SERVICE])
+            .output()
+            .map_err(|e| format!("清理 Keychain 失败: {e}"))?;
+        if !output.status.success() {
+            break;
+        }
     }
-
-    profile.meta = extract_meta(Some(&claude_json), keychain_password.as_deref());
-    profile.claude_json = claude_json;
-    profile.settings_json = settings_json;
-    profile.keychain_password = keychain_password;
-    profile.updated_at = Utc::now();
     Ok(())
 }
 
-fn refresh_current_profile_snapshot(store: &mut Store, target_id: &str) -> Result<(), String> {
+/// 把账号材料的某一处「写回」到 before 快照里的原值：
+/// 有原值就写回去，原本不存在就删掉文件。统一给回滚用，避免回滚时把文件写成空 JSON。
+fn restore_json_file(path: PathBuf, original: Option<&Value>) -> Result<(), String> {
+    match original {
+        Some(value) => write_json_pretty(path, value),
+        None => {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 事务回滚：用 before 快照把账号材料（~/.claude.json、settings.json、Keychain）
+/// 全部还原回写动作之前的状态。
+///
+/// 设计要点：
+/// - 这是 best-effort 的「补救」步骤，本身绝不再调用 `apply_account_material`，
+///   也不依赖任何会再次触发回滚的路径，因此不存在死循环。
+/// - 即便某一步还原失败，也继续尝试还原其余几处，把所有失败原因汇总返回，
+///   交给调用方拼进最终错误信息。
+fn rollback_account_material(snapshot: &BackupSnapshot) -> Vec<String> {
+    let mut failures = Vec::new();
+
+    match claude_json_path() {
+        Ok(path) => {
+            if let Err(e) = restore_json_file(path, snapshot.claude_json.as_ref()) {
+                failures.push(format!("还原 ~/.claude.json 失败: {e}"));
+            }
+        }
+        Err(e) => failures.push(format!("定位 ~/.claude.json 失败: {e}")),
+    }
+
+    match claude_settings_path() {
+        Ok(path) => {
+            if let Err(e) = restore_json_file(path, snapshot.settings_json.as_ref()) {
+                failures.push(format!("还原 ~/.claude/settings.json 失败: {e}"));
+            }
+        }
+        Err(e) => failures.push(format!("定位 ~/.claude/settings.json 失败: {e}")),
+    }
+
+    let keychain_result = match &snapshot.keychain {
+        Some(password) => write_keychain_password(password),
+        None => clear_keychain_password(),
+    };
+    if let Err(e) = keychain_result {
+        failures.push(format!("还原 Keychain 失败: {e}"));
+    }
+
+    failures
+}
+
+/// 写账号材料的语义模式：
+/// - `Merge`（switch_profile 用）：~/.claude.json 走 merge_claude_json 只覆盖账号字段，
+///   保留 live 的非账号字段；`None` 的项一律「不动」（跳过）。
+/// - `FullReplace`（restore_backup 用）：「回滚到备份时刻」语义——
+///   ~/.claude.json / settings.json 用备份值**整体覆盖**（不 merge）；
+///   备份里为 `None` 的项 → **删除**当前文件 / **清空** Keychain，而不是跳过。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    Merge,
+    FullReplace,
+}
+
+/// 带事务回滚地写入账号材料：~/.claude.json、settings.json、Keychain。
+/// 任一步写失败，立刻用 `rollback_from` before 快照把已经写下去的几处还原回去，
+/// 再返回 Err 说明「已回滚」。
+///
+/// 参数：
+/// - `mode`：`Merge` 合并账号字段 / `FullReplace` 整体覆盖（详见 [`WriteMode`]）；
+/// - `claude_json`：要写进 ~/.claude.json 的来源；
+/// - `settings`：要写入的 settings.json；
+/// - `keychain`：要写入 Keychain 的凭据；
+/// - `rollback_from`：调用方在写之前已经创建好的 before 快照，作为回滚源。
+///
+/// `None` 语义随 `mode` 不同（Merge=跳过，FullReplace=删除/清空），见上文。
+///
+/// 目标：不再出现「账号 JSON 已变但 settings/钥匙串没变」的半成品状态。
+fn apply_account_material(
+    mode: WriteMode,
+    claude_json: Option<&Value>,
+    settings: Option<&Value>,
+    keychain: Option<&str>,
+    rollback_from: &BackupSnapshot,
+) -> Result<(), String> {
+    // 任意一步失败：先回滚，再把「原始错误 + 回滚结果」拼成最终错误返回。
+    fn fail_with_rollback(reason: String, rollback_from: &BackupSnapshot) -> String {
+        let failures = rollback_account_material(rollback_from);
+        if failures.is_empty() {
+            format!("{reason}；已回滚到操作前状态")
+        } else {
+            format!(
+                "{reason}；尝试回滚但部分步骤失败：{}",
+                failures.join("；")
+            )
+        }
+    }
+
+    // ── ~/.claude.json ──
+    match (mode, claude_json) {
+        (WriteMode::Merge, Some(source)) => {
+            let path = match claude_json_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("定位 ~/.claude.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            // Merge：保留 live ~/.claude.json 的非账号字段，只覆盖账号相关字段。
+            let current = match read_json_optional(path.clone()) {
+                Ok(current) => current,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("读取 live ~/.claude.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            let next = merge_claude_json(current, source);
+            if let Err(e) = write_json_pretty(path, &next) {
+                return Err(fail_with_rollback(
+                    format!("写入 ~/.claude.json 失败: {e}"),
+                    rollback_from,
+                ));
+            }
+        }
+        (WriteMode::FullReplace, Some(source)) => {
+            let path = match claude_json_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("定位 ~/.claude.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            // FullReplace：整体覆盖，不 merge。
+            if let Err(e) = write_json_pretty(path, source) {
+                return Err(fail_with_rollback(
+                    format!("写入 ~/.claude.json 失败: {e}"),
+                    rollback_from,
+                ));
+            }
+        }
+        (WriteMode::FullReplace, None) => {
+            // FullReplace 且备份里没有 claude_json：删除当前文件（回到「原本没有」）。
+            let path = match claude_json_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("定位 ~/.claude.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    return Err(fail_with_rollback(
+                        format!("删除 ~/.claude.json 失败: {e}"),
+                        rollback_from,
+                    ));
+                }
+            }
+        }
+        (WriteMode::Merge, None) => {
+            // Merge 且无来源：不动 ~/.claude.json。
+        }
+    }
+
+    // ── ~/.claude/settings.json ──
+    match (mode, settings) {
+        (_, Some(settings)) => {
+            let path = match claude_settings_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("定位 ~/.claude/settings.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            if let Err(e) = write_json_pretty(path, settings) {
+                return Err(fail_with_rollback(
+                    format!("写入 ~/.claude/settings.json 失败: {e}"),
+                    rollback_from,
+                ));
+            }
+        }
+        (WriteMode::FullReplace, None) => {
+            // FullReplace 且备份里没有 settings：删除当前 settings.json。
+            let path = match claude_settings_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    return Err(fail_with_rollback(
+                        format!("定位 ~/.claude/settings.json 失败: {e}"),
+                        rollback_from,
+                    ))
+                }
+            };
+            if path.exists() {
+                if let Err(e) = fs::remove_file(&path) {
+                    return Err(fail_with_rollback(
+                        format!("删除 ~/.claude/settings.json 失败: {e}"),
+                        rollback_from,
+                    ));
+                }
+            }
+        }
+        (WriteMode::Merge, None) => {
+            // Merge 且无 settings：不动 settings.json。
+        }
+    }
+
+    // ── Keychain ──
+    match (mode, keychain) {
+        (_, Some(password)) => {
+            if let Err(e) = write_keychain_password(password) {
+                return Err(fail_with_rollback(
+                    format!("写入 Keychain 失败: {e}"),
+                    rollback_from,
+                ));
+            }
+        }
+        (WriteMode::FullReplace, None) => {
+            // FullReplace 且备份里没有 keychain：清空 Keychain（回到「原本没有」）。
+            if let Err(e) = clear_keychain_password() {
+                return Err(fail_with_rollback(
+                    format!("清空 Keychain 失败: {e}"),
+                    rollback_from,
+                ));
+            }
+        }
+        (WriteMode::Merge, None) => {
+            // Merge 且无 keychain：不动 Keychain。
+        }
+    }
+
+    Ok(())
+}
+
+/// 写账号材料前用于回滚的 before 快照。
+///
+/// 三个字段分别是写动作前磁盘/钥匙串里的原值：
+/// - `claude_json` / `settings_json` 为 `None` 表示原本文件不存在（回滚时应删除而非写空）；
+/// - `keychain` 为 `None` 表示原本没有钥匙串条目（回滚时应清空而非写空）。
+#[derive(Debug, Clone)]
+struct BackupSnapshot {
+    claude_json: Option<Value>,
+    settings_json: Option<Value>,
+    keychain: Option<String>,
+}
+
+impl BackupSnapshot {
+    /// 从一份备份文件的 JSON（含 claude_json / settings_json / keychain_password 字段）
+    /// 解出回滚快照。备份里这几项缺失/为 null 都按「原本不存在」处理。
+    ///
+    /// C2：备份里的 keychain_password 可能是加密值（"enc:v1:..."）或旧明文，
+    /// 这里统一 decrypt_secret 解回明文——回滚/恢复时要把真正的 OAuth blob 写进
+    /// 真实 Keychain，不能写加密串。解密失败返回清晰 Err（不 panic）。
+    fn from_backup_value(backup: &Value) -> Result<Self, String> {
+        let keychain = match backup
+            .get("keychain_password")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => Some(decrypt_secret(raw)?),
+            None => None,
+        };
+        Ok(BackupSnapshot {
+            claude_json: backup.get("claude_json").filter(|v| !v.is_null()).cloned(),
+            settings_json: backup
+                .get("settings_json")
+                .filter(|v| !v.is_null())
+                .cloned(),
+            keychain,
+        })
+    }
+}
+
+fn update_profile_from_snapshot(
+    profile: &mut StoredProfile,
+    claude_json: Value,
+    settings_json: Option<Value>,
+    keychain_password: String,
+) {
+    profile.meta = extract_meta(Some(&claude_json), Some(keychain_password.as_str()));
+    profile.claude_json = claude_json;
+    profile.settings_json = settings_json;
+    profile.keychain_password = Some(keychain_password);
+    profile.updated_at = Utc::now();
+}
+
+/// 切换前 best-effort 回写「当前活账号」的 live 快照到它对应的 profile。
+///
+/// 设计原则（N1 / N2）：
+/// - live 快照不完整（缺 ~/.claude.json 或缺 Keychain）→ 跳过回写，绝不用 `?` 把错误
+///   传播出去阻断后续 switch；只把原因作为 warning 返回。
+/// - 回写前做身份校验：live 的 oauthAccount.accountUuid 必须与该 profile.meta.account_uuid
+///   一致才回写；不一致或 live 拿不到 accountUuid（无法确认身份）→ 保守跳过并 warn，
+///   绝不能用别人的凭据覆盖该 profile。
+///
+/// 返回需要冒泡给前端的 warning 列表（可能为空）。
+fn refresh_current_profile_snapshot(store: &mut Store, target_id: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+
     let Some(current_id) = store.current_profile_id.clone() else {
-        return Ok(());
+        return warnings;
     };
     if current_id == target_id {
-        return Ok(());
+        return warnings;
     }
     let Some(profile) = store.profiles.iter_mut().find(|p| p.id == current_id) else {
-        return Ok(());
+        return warnings;
     };
-    let (claude_json, settings_json, keychain_password) = current_snapshot()?;
-    update_profile_from_snapshot(profile, claude_json, settings_json, keychain_password)
+
+    // best-effort 抓取 live 快照；任何一步失败都不阻断切号，只跳过回写。
+    let (claude_json, settings_json, keychain_password) = match current_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            warnings.push(format!(
+                "未能读取当前账号 live 快照，已跳过对「{}」的回写：{err}",
+                profile.name
+            ));
+            return warnings;
+        }
+    };
+
+    // N1：快照不完整就跳过回写。
+    let Some(claude_json) = claude_json else {
+        warnings.push(format!(
+            "当前缺少 ~/.claude.json，已跳过对「{}」的快照回写",
+            profile.name
+        ));
+        return warnings;
+    };
+    let Some(keychain_password) = keychain_password else {
+        warnings.push(format!(
+            "当前缺少 Keychain {KEYCHAIN_SERVICE}，已跳过对「{}」的快照回写",
+            profile.name
+        ));
+        return warnings;
+    };
+
+    // N2：身份校验。live 拿不到 accountUuid → 无法确认身份，保守跳过。
+    let Some(live_uuid) = string_field(&claude_json, &["oauthAccount", "accountUuid"]) else {
+        warnings.push(format!(
+            "无法从 live ~/.claude.json 读取 accountUuid，无法确认身份，已跳过对「{}」的回写",
+            profile.name
+        ));
+        return warnings;
+    };
+    match profile.meta.account_uuid.as_deref() {
+        Some(profile_uuid) if profile_uuid == live_uuid => {
+            update_profile_from_snapshot(profile, claude_json, settings_json, keychain_password);
+        }
+        _ => {
+            warnings.push(format!(
+                "当前 live 身份（accountUuid={live_uuid}）与账号「{}」不一致，可能是手动登录了别的号，已跳过回写以免覆盖凭据",
+                profile.name
+            ));
+        }
+    }
+
+    warnings
 }
 
 fn create_backup_with_label(label: &str) -> Result<BackupResult, String> {
     ensure_app_dirs()?;
     let (claude_json, settings_json, keychain_password) = current_snapshot()?;
+    // C2：备份文件里的 keychain_password 同样加密落盘（claude_json/settings 保持明文）。
+    let keychain_password = match keychain_password {
+        Some(plain) => Some(encrypt_keychain_field(&plain)?),
+        None => None,
+    };
     let id = format!("{}-{}", Utc::now().format("%Y%m%d%H%M%S"), Uuid::new_v4());
     let path = backups_dir()?.join(format!("{id}.json"));
     let backup = json!({
@@ -570,11 +1206,186 @@ fn create_backup_with_label(label: &str) -> Result<BackupResult, String> {
         "keychain_password": keychain_password,
     });
     write_json_pretty(path.clone(), &backup)?;
+    // H4：成功落盘后只保留最近 30 个备份，best-effort 清理旧的，不阻断主流程。
+    prune_backups(30);
     Ok(BackupResult {
         id,
         path: path.to_string_lossy().to_string(),
         created_at: Utc::now(),
     })
+}
+
+/// 把已落盘的备份文件（按路径）读回成回滚快照。
+/// 给 switch_profile / restore_backup 复用「它们刚创建的 before-* 备份」做回滚源。
+fn load_backup_snapshot(path: &PathBuf) -> Result<BackupSnapshot, String> {
+    let raw = fs::read_to_string(path).map_err(|e| format!("读取备份失败: {e}"))?;
+    let backup: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("备份 JSON 解析失败: {e}"))?;
+    BackupSnapshot::from_backup_value(&backup)
+}
+
+/// best-effort 清理 backups 目录，只保留最近 `keep` 个 `.json` 备份。
+/// 任何 IO 错误都静默忽略——清理失败不应影响备份/切号主流程。
+fn prune_backups(keep: usize) {
+    let Ok(dir) = backups_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+
+    // 收集 (排序键, 路径)。排序键优先用文件名（备份名以 %Y%m%d%H%M%S 时间戳开头，
+    // 字典序即时间序），mtime 作为兜底辅助。
+    let mut files: Vec<(String, std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+        })
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let mtime = path
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (name, mtime, path)
+        })
+        .collect();
+
+    if files.len() <= keep {
+        return;
+    }
+
+    // 升序排序（最旧在前）：先按文件名（时间戳）字典序，再按 mtime。
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let remove_count = files.len() - keep;
+    for (_, _, path) in files.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// H2：best-effort 检测 Claude Code CLI 是否在运行（仅用于提示重启，非阻断）。
+/// 尽量精确匹配 Claude Code CLI 进程，避免把本工具（claude-switcher）自身误判进来。
+fn claude_code_running() -> bool {
+    // pgrep -f -l 输出 "pid command"，便于过滤掉 claude-switcher 自身。
+    let Ok(output) = Command::new("pgrep").args(["-f", "-l", "claude"]).output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().any(|line| {
+        let lower = line.to_ascii_lowercase();
+        // 命中 Claude Code CLI（"claude" 可执行 / @anthropic-ai/claude-code），
+        // 但排除本工具自身与 macOS 桌面版 Claude.app 之类的无关进程。
+        let is_self = lower.contains("claude-switcher") || lower.contains("claude_switcher");
+        if is_self {
+            return false;
+        }
+        // 精确一点：CLI 入口通常是 "claude" 命令或 claude-code 包路径。
+        lower.contains("claude-code")
+            || lower.contains("claude code")
+            || lower.split_whitespace().any(|tok| {
+                let base = tok.rsplit('/').next().unwrap_or(tok);
+                base == "claude"
+            })
+    })
+}
+
+/// N3：检测 ~/.claude/settings.json 是否含 apiKeyHelper 字段（会覆盖 OAuth，使切号失效）。
+fn settings_has_api_key_helper() -> bool {
+    let Ok(path) = claude_settings_path() else {
+        return false;
+    };
+    match read_json_optional(path) {
+        Ok(Some(value)) => value
+            .get("apiKeyHelper")
+            .map(|v| !v.is_null())
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// 遥测去关联核心 helper（幂等）：把 `mode` 对应的隐私 env 合并/清理进
+/// ~/.claude/settings.json 的 "env" 字段，让用户启动的 Claude Code 关闭把同设备
+/// 多账号串起来的遥测。
+///
+/// 语义（严格只动这两个 key，不碰 settings.env 里其它 key、也不碰 settings 其它字段）：
+/// 1. settings.json 不存在 → 当空对象 `{}`；确保 settings 是 object、settings.env 是 object。
+/// 2. 先从 settings.env **删除** DISABLE_TELEMETRY 和
+///    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 两个 key（保证互斥 + 切模式时净清理）。
+/// 3. 再按 `mode` 加回对应 key（值 "1"）；`Default` 模式两个都不加（净删除）。
+/// 4. 收尾：若 settings.env 变空则把空 "env" 对象删掉；最终 settings 非空才写回
+///    （write_json_pretty，权限 600）。
+///
+/// 注意：settings.json 原本**不存在**且 `mode == Default` 时不要凭空创建文件
+///（最终 settings 仍是空 `{}` → 不写）。
+fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
+    let path = claude_settings_path()?;
+    let existed = path.exists();
+
+    // 读现有 settings；不存在则当空对象 {}。
+    let mut settings = match read_json_optional(path.clone())? {
+        Some(value) => value,
+        None => json!({}),
+    };
+    // 确保 settings 顶层是 object（非 object 一律重置为空对象，避免污染）。
+    if !settings.is_object() {
+        settings = json!({});
+    }
+
+    // 确保 settings.env 是 object（缺失或非 object 都重建为空对象）。
+    {
+        let obj = settings.as_object_mut().expect("settings 已确保为 object");
+        let needs_reset = obj.get("env").map(|v| !v.is_object()).unwrap_or(true);
+        if needs_reset {
+            obj.insert("env".to_string(), json!({}));
+        }
+    }
+
+    // 先从 settings.env 把两个隐私 key 删干净（互斥 + 净清理），再按模式加回对应的。
+    {
+        let env_obj = settings
+            .get_mut("env")
+            .and_then(|v| v.as_object_mut())
+            .expect("settings.env 已确保为 object");
+        env_obj.remove(ENV_DISABLE_TELEMETRY);
+        env_obj.remove(ENV_DISABLE_NONESSENTIAL_TRAFFIC);
+        if let Some(key) = mode.env_key() {
+            env_obj.insert(key.to_string(), json!("1"));
+        }
+        // Default 模式：两个都不加（净删除）。
+    }
+
+    // 收尾：如果 settings.env 变空了，把这个空 "env" 对象删掉，别留空壳。
+    {
+        let obj = settings.as_object_mut().expect("settings 仍为 object");
+        let env_empty = obj
+            .get("env")
+            .and_then(|v| v.as_object())
+            .map(|m| m.is_empty())
+            .unwrap_or(false);
+        if env_empty {
+            obj.remove("env");
+        }
+    }
+
+    // 写回策略：
+    // - 文件原本不存在 且 清理后为空（Default 模式没东西要加）→ 不凭空建文件。
+    // - 文件原本存在 → 必须写回清理后的结果（哪怕变成 {}），否则切到 Default 时
+    //   磁盘上的旧隐私 key 不会被真正移除（这正是之前漏掉净删除的 bug）。
+    let is_empty = settings.as_object().map(|m| m.is_empty()).unwrap_or(true);
+    if !existed && is_empty {
+        return Ok(());
+    }
+
+    write_json_pretty(path, &settings)
 }
 
 #[tauri::command]
@@ -614,6 +1425,12 @@ fn get_status() -> Result<ClaudeStatus, String> {
             auth_envs.join(", ")
         ));
     }
+    if settings_has_api_key_helper() {
+        warnings.push(
+            "~/.claude/settings.json 含 apiKeyHelper 字段，会覆盖 Keychain OAuth，切号可能无效"
+                .to_string(),
+        );
+    }
 
     Ok(ClaudeStatus {
         claude_json_exists: claude_json_path()?.exists(),
@@ -628,8 +1445,35 @@ fn get_status() -> Result<ClaudeStatus, String> {
         backup_dir: backups_dir()?.to_string_lossy().to_string(),
         profile_count: store.profiles.len(),
         current_profile_id: store.current_profile_id,
+        telemetry_mode: store.telemetry_mode,
         warnings,
     })
+}
+
+/// 设置遥测去关联模式：解析 `mode`（非法值报错）→ 持久化进 Store（save_store）→
+/// **立即**把对应隐私 env 合并/清理进当前 ~/.claude/settings.json。
+///
+/// 选型说明：get 端把 telemetry_mode 并进了 get_status() 的返回（ClaudeStatus.telemetry_mode），
+/// 因此这里只提供 set 命令，不再单独加 get_telemetry_mode()。
+#[tauri::command]
+fn set_telemetry_mode(mode: String) -> Result<(), String> {
+    // 解析前后端契约里的 camelCase 字符串；非法值明确报错。
+    let parsed = match mode.trim() {
+        "default" => TelemetryMode::Default,
+        "disableTelemetry" => TelemetryMode::DisableTelemetry,
+        "essentialOnly" => TelemetryMode::EssentialOnly,
+        other => {
+            return Err(format!(
+                "非法的遥测模式「{other}」，只接受 default / disableTelemetry / essentialOnly"
+            ))
+        }
+    };
+
+    // 先持久化进 store，再立即落地到 settings.json（顺序：先存意图，后写文件）。
+    let mut store = load_store()?;
+    store.telemetry_mode = parsed;
+    save_store(&store)?;
+    apply_privacy_env_to_settings(parsed)
 }
 
 #[tauri::command]
@@ -689,7 +1533,8 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         last_switched_at: profile.last_switched_at,
         meta: profile.meta.clone(),
         clash: profile.clash.clone(),
-        is_current: false,
+        // 下面会把 current_profile_id 指向这个新建 profile，所以它就是当前账号。
+        is_current: true,
     };
     store.current_profile_id = Some(profile.id.clone());
     store.profiles.push(profile);
@@ -726,8 +1571,19 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     if !store.profiles.iter().any(|p| p.id == id) {
         return Err("找不到这个账号快照".to_string());
     }
+    let mut warnings = Vec::new();
+
+    // H2：切号前 best-effort 检测 Claude Code 是否在运行（非阻断）。
+    if claude_code_running() {
+        warnings.push(
+            "检测到 Claude Code 仍在运行，切换不会作用于已运行的会话，请切换后重启 Claude Code"
+                .to_string(),
+        );
+    }
+
     let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
-    refresh_current_profile_snapshot(&mut store, &id)?;
+    // N1/N2：回写当前账号快照是 best-effort，不会阻断切号，只把跳过原因作为 warning 返回。
+    warnings.extend(refresh_current_profile_snapshot(&mut store, &id));
     let idx = store
         .profiles
         .iter()
@@ -745,15 +1601,25 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
         None
     };
 
-    let current_claude_json = read_json_optional(claude_json_path()?)?;
-    let next_claude_json = merge_claude_json(current_claude_json, &profile.claude_json);
-    write_json_pretty(claude_json_path()?, &next_claude_json)?;
+    // 事务化写入账号材料：用刚创建的 before-switch 备份做回滚源，
+    // 任一步写失败都会把 ~/.claude.json / settings.json / Keychain 整体还原，
+    // 杜绝「JSON 已改但 settings/钥匙串没改」的半成品状态。
+    let rollback_from = load_backup_snapshot(&PathBuf::from(&backup.path))?;
+    apply_account_material(
+        // switch 维持 merge 语义不变：只覆盖账号字段，保留 live 的非账号字段。
+        WriteMode::Merge,
+        Some(&profile.claude_json),
+        profile.settings_json.as_ref(),
+        profile.keychain_password.as_deref(),
+        &rollback_from,
+    )?;
 
-    if let Some(settings) = &profile.settings_json {
-        write_json_pretty(claude_settings_path()?, settings)?;
-    }
-    if let Some(password) = &profile.keychain_password {
-        write_keychain_password(password)?;
+    // 保持性：profile 自带的 settings_json 可能不含隐私 env，切号刚写完 settings 后
+    // 立即按 store 当前 telemetry_mode 把隐私 env 合并回去，避免切号把去关联冲掉。
+    // 已过事务回滚保护区、账号材料已成功落盘——隐私 env 注入失败属非关键，best-effort：
+    // 只记 warning，不让整个切号返回 Err（否则会出现「其实已切但 UI 报失败」的半成品态）。
+    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+        warnings.push(format!("隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"));
     }
 
     store.current_profile_id = Some(profile.id.clone());
@@ -766,6 +1632,7 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
         backup,
         clash: clash_result,
         restart_hint: "切换已写入磁盘和 Keychain；请重启正在运行的 Claude Code 会话。".to_string(),
+        warnings,
     })
 }
 
@@ -868,6 +1735,170 @@ fn create_backup() -> Result<BackupResult, String> {
     create_backup_with_label("manual")
 }
 
+/// 扫描 backups 目录下的 *.json，解析每个备份的 id/label/created_at，
+/// 按 created_at 倒序（最新在前）返回。解析失败的单个文件跳过，不阻断整体列举。
+#[tauri::command]
+fn list_backups() -> Result<Vec<BackupSummary>, String> {
+    ensure_app_dirs()?;
+    let dir = backups_dir()?;
+    let entries = match fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        // 目录不存在/读不出来：当成空列表，不报错。
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut summaries: Vec<BackupSummary> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
+        })
+        .filter_map(|path| {
+            // 文件名（仅用于日志，避免泄露完整路径）。
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("<unknown>")
+                .to_string();
+            // 单个文件读失败：打一行 warn（含文件名）再跳过，不再静默 .ok()? 丢弃。
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    eprintln!("[claude-switcher] list_backups: 跳过坏备份「{file_name}」(读取失败): {e}");
+                    return None;
+                }
+            };
+            // 单个文件 JSON 解析失败：同样 warn + 跳过，不污染整列表。
+            let value: Value = match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(e) => {
+                    eprintln!("[claude-switcher] list_backups: 跳过坏备份「{file_name}」(JSON 解析失败): {e}");
+                    return None;
+                }
+            };
+            // id 优先取文件内字段，缺失就退回文件名（去掉 .json 扩展名）。
+            let id = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    path.file_stem()
+                        .and_then(|n| n.to_str())
+                        .map(ToOwned::to_owned)
+                })?;
+            let label = value
+                .get("label")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let created_at = value
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(BackupSummary {
+                id,
+                label,
+                created_at,
+            })
+        })
+        .collect();
+
+    // 倒序：created_at 是 RFC3339 ISO 字符串，字典序即时间序，倒排即最新在前。
+    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(summaries)
+}
+
+/// H1：从 ~/.claude-switcher/backups/<id>.json 把 claude_json / settings_json /
+/// keychain_password 写回磁盘和钥匙串。恢复前自动创建一份 before-restore 备份。
+#[tauri::command]
+fn restore_backup(id: String) -> Result<RestoreResult, String> {
+    let clean_id = id.trim();
+    if clean_id.is_empty() {
+        return Err("备份 id 不能为空".to_string());
+    }
+    // 防路径穿越：备份名只允许时间戳/uuid 字符。
+    if clean_id.contains('/') || clean_id.contains('\\') || clean_id.contains("..") {
+        return Err("非法的备份 id".to_string());
+    }
+
+    let path = backups_dir()?.join(format!("{clean_id}.json"));
+    if !path.exists() {
+        return Err(format!("找不到备份文件: {}", path.to_string_lossy()));
+    }
+    let raw = fs::read_to_string(&path).map_err(|e| format!("读取备份失败: {e}"))?;
+    let backup: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("备份 JSON 解析失败: {e}"))?;
+
+    let mut warnings = Vec::new();
+
+    // H2：恢复前 best-effort 检测 Claude Code 是否在运行（非阻断）。
+    if claude_code_running() {
+        warnings.push(
+            "检测到 Claude Code 仍在运行，恢复不会作用于已运行的会话，请恢复后重启 Claude Code"
+                .to_string(),
+        );
+    }
+
+    // 先备份当前状态，避免恢复把现状冲掉后无法回退；这份 before-restore 备份同时作为回滚源。
+    let backup_result = create_backup_with_label("before-restore")?;
+
+    let claude_json = backup.get("claude_json").filter(|v| !v.is_null());
+    let settings_json = backup.get("settings_json").filter(|v| !v.is_null());
+    // C2：备份里的 keychain_password 可能是加密值或旧明文，写进真实 Keychain 前先解密。
+    let keychain_password = match backup
+        .get("keychain_password")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(decrypt_secret(raw)?),
+        None => None,
+    };
+
+    if claude_json.is_none() && settings_json.is_none() && keychain_password.is_none() {
+        return Err("该备份不包含任何可恢复的内容".to_string());
+    }
+
+    // FullReplace 语义：缺失的项不是「跳过」而是「删除/清空」，把告警措辞改成回滚语义。
+    if claude_json.is_none() {
+        warnings.push("备份缺少 claude_json，将删除当前 ~/.claude.json（完整还原到备份时刻）".to_string());
+    }
+    if settings_json.is_none() {
+        warnings.push("备份缺少 settings_json，将删除当前 ~/.claude/settings.json（完整还原到备份时刻）".to_string());
+    }
+    if keychain_password.is_none() {
+        warnings.push("备份缺少 keychain_password，将清空当前 Keychain（完整还原到备份时刻）".to_string());
+    }
+
+    // 事务化恢复：用刚创建的 before-restore 备份做回滚源，与 switch_profile 走同一 helper，
+    // 任一步写失败都会把账号材料整体还原回恢复前的状态。
+    // restore 用 FullReplace：整体覆盖 + 缺失即删除/清空，符合「回滚到备份时刻」语义。
+    let rollback_from = load_backup_snapshot(&PathBuf::from(&backup_result.path))?;
+    apply_account_material(
+        WriteMode::FullReplace,
+        claude_json,
+        settings_json,
+        keychain_password.as_deref(),
+        &rollback_from,
+    )?;
+
+    // 保持性：FullReplace 可能整体覆盖甚至删除 settings.json（备份缺 settings_json 时），
+    // 把隐私 env 冲掉。恢复刚写完/删完 settings 后，立即按 store 当前 telemetry_mode
+    // 把隐私 env 合并回去；helper 幂等，settings 不存在时会按需重建（Default 模式不建文件）。
+    // 调用时机在 apply_account_material 之后、已过事务回滚保护区；恢复已成功落盘，
+    // 隐私 env 注入失败属非关键，best-effort：只记 warning，不让恢复返回 Err。
+    let store = load_store()?;
+    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+        warnings.push(format!("隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"));
+    }
+
+    Ok(RestoreResult {
+        restored_from: clean_id.to_string(),
+        backup: backup_result,
+        warnings,
+    })
+}
+
 #[tauri::command]
 fn open_data_dir() -> Result<(), String> {
     let path = app_data_dir()?;
@@ -904,6 +1935,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_status,
+            set_telemetry_mode,
             list_profiles,
             capture_current_profile,
             switch_profile,
@@ -914,6 +1946,8 @@ pub fn run() {
             delete_profile,
             rename_profile,
             create_backup,
+            list_backups,
+            restore_backup,
             open_data_dir,
             inspect_local_files,
         ])

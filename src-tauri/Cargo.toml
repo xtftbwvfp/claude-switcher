@@ -24,3 +24,7 @@ dirs = "5"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 urlencoding = "2"
+# C2：store/备份里的 keychain_password（OAuth blob，唯一明文 token）落盘加密用。
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
