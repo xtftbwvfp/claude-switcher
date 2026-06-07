@@ -70,7 +70,6 @@ struct ProfileMeta {
     organization_uuid: Option<String>,
     organization_name: Option<String>,
     user_id_hash: Option<String>,
-    credential_hash: Option<String>,
     has_oauth_account: bool,
     has_keychain_credentials: bool,
     has_trusted_device_token: bool,
@@ -385,7 +384,6 @@ fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) ->
 
     if let Some(raw) = keychain_password {
         meta.has_keychain_credentials = true;
-        meta.credential_hash = Some(hash_short(raw));
         if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
             let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
             meta.has_trusted_device_token = oauth.get("trustedDeviceToken").is_some();
@@ -519,23 +517,8 @@ fn load_or_create_store_key() -> Result<[u8; 32], String> {
     rand::rngs::OsRng.fill_bytes(&mut key);
     let b64 = BASE64.encode(key);
 
-    let write = Command::new("security")
-        .arg("add-generic-password")
-        .arg("-U")
-        .arg("-a")
-        .arg(&username)
-        .arg("-s")
-        .arg(STORE_KEY_KEYCHAIN_SERVICE)
-        .arg("-w")
-        .arg(&b64)
-        .output()
+    keychain_write(&username, STORE_KEY_KEYCHAIN_SERVICE, &b64)
         .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
-    if !write.status.success() {
-        return Err(format!(
-            "写入 store 加密密钥失败: {}",
-            String::from_utf8_lossy(&write.stderr)
-        ));
-    }
     Ok(key)
 }
 
@@ -737,6 +720,71 @@ fn switch_clash_node_internal(group: &str, node: &str) -> Result<ClashSwitchResu
     })
 }
 
+/// 把 value（UTF-8 文本）写入 keychain 项（account/service）。
+/// 优先用 `security -i` 从 stdin 喂命令，让 payload 不出现在 argv（被 ps / 进程监控
+/// 看到）——与官方 Claude Code 的做法一致；仅当命令行超过 security -i 的 stdin 行缓冲
+/// （~4096B fgets）时回退 argv，避免静默截断损坏。value 一律以 -X <hex> 存储
+/// （读回用 -w 即得回原文本），规避命令行转义。
+fn keychain_write(account: &str, service: &str, value: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let hex = hex_encode(value);
+    let command =
+        format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X {hex}\n");
+    // security -i 的 fgets 缓冲是 4096B，留 64B 余量。
+    const STDIN_LINE_LIMIT: usize = 4096 - 64;
+
+    if command.len() <= STDIN_LINE_LIMIT {
+        let mut child = Command::new("security")
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| "写入 Keychain 失败：无法获取 security stdin".to_string())?
+            .write_all(command.as_bytes())
+            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err(format!(
+            "写入 Keychain 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+
+    // payload 过大：回退 argv（hex 会短暂出现在 ps，但优于截断损坏）。
+    let out = Command::new("security")
+        .args([
+            "add-generic-password",
+            "-U",
+            "-a",
+            account,
+            "-s",
+            service,
+            "-X",
+            &hex,
+        ])
+        .output()
+        .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "写入 Keychain 失败: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ))
+    }
+}
+
 fn write_keychain_password(password: &str) -> Result<(), String> {
     let username = current_username()?;
 
@@ -766,26 +814,7 @@ fn write_keychain_password(password: &str) -> Result<(), String> {
         }
     }
 
-    let output = Command::new("security")
-        .arg("add-generic-password")
-        .arg("-U")
-        .arg("-a")
-        .arg(&username)
-        .arg("-s")
-        .arg(KEYCHAIN_SERVICE)
-        .arg("-X")
-        .arg(hex_encode(password))
-        .output()
-        .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "写入 Keychain 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
+    keychain_write(&username, KEYCHAIN_SERVICE, password)
 }
 
 /// live 快照三元组：(~/.claude.json, ~/.claude/settings.json, Keychain 凭据)。

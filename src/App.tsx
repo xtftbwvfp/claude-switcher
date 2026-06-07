@@ -9,7 +9,6 @@ import {
   EyeOff,
   FileKey,
   Fingerprint,
-  KeyRound,
   History,
   Loader2,
   Network,
@@ -28,7 +27,6 @@ interface ProfileMeta {
   organization_uuid?: string | null;
   organization_name?: string | null;
   user_id_hash?: string | null;
-  credential_hash?: string | null;
   has_oauth_account: boolean;
   has_keychain_credentials: boolean;
   has_trusted_device_token: boolean;
@@ -68,6 +66,7 @@ interface ClaudeStatus {
   profile_count: number;
   current_profile_id?: string | null;
   warnings: string[];
+  telemetry_mode: TelemetryMode;
 }
 
 interface BackupResult {
@@ -225,17 +224,8 @@ function App() {
       setBackups(nextBackups);
       setClashStatus(nextClashStatus);
 
-      // 遥测模式：优先取 get_status 里可能并入的 telemetry_mode，否则回退到独立命令。
-      const inlineMode = (nextStatus as unknown as { telemetry_mode?: string })
-        .telemetry_mode;
-      if (inlineMode) {
-        setTelemetryMode(inlineMode as TelemetryMode);
-      } else {
-        const mode = await invoke<string>('get_telemetry_mode').catch(
-          () => 'disableTelemetry',
-        );
-        setTelemetryMode(mode as TelemetryMode);
-      }
+      // 遥测模式：get_status 始终带 telemetry_mode（后端非 Option 字段）。
+      setTelemetryMode(nextStatus.telemetry_mode);
     } catch (err) {
       setError(String(err));
     } finally {
@@ -420,7 +410,6 @@ function App() {
             <Field label="账号 UUID" value={shortId(status?.meta.account_uuid)} />
             <Field label="组织 UUID" value={shortId(status?.meta.organization_uuid)} />
             <Field label="Device ID 哈希" value={status?.meta.user_id_hash} />
-            <Field label="凭据哈希" value={status?.meta.credential_hash} />
             <Field label="订阅" value={status?.meta.subscription_type} />
             <Field label="限额层级" value={status?.meta.rate_limit_tier} />
           </div>
@@ -540,10 +529,6 @@ function App() {
                   <span>
                     <Fingerprint />
                     Device {profile.meta.user_id_hash || '无'}
-                  </span>
-                  <span>
-                    <KeyRound />
-                    Key {profile.meta.credential_hash || '无'}
                   </span>
                   <span>
                     <Clock />
