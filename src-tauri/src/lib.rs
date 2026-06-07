@@ -10,6 +10,12 @@ use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 const DEFAULT_CLASH_GROUP: &str = "Auto-Claude";
+const AUTH_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY_HELPER",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredProfile {
@@ -279,14 +285,56 @@ fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) ->
     meta
 }
 
+fn current_username() -> String {
+    std::env::var("USER").unwrap_or_else(|_| {
+        Command::new("whoami")
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "xiaojian".to_string())
+    })
+}
+
+fn hex_encode(input: &str) -> String {
+    input
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
 fn read_keychain_password() -> Result<Option<String>, String> {
+    let username = current_username();
     let output = Command::new("security")
-        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .arg("find-generic-password")
+        .arg("-a")
+        .arg(&username)
+        .arg("-s")
+        .arg(KEYCHAIN_SERVICE)
+        .arg("-w")
         .output()
         .map_err(|e| format!("读取 Keychain 失败: {e}"))?;
 
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+        return Ok(Some(text));
+    }
+
+    // Migration fallback for early claude-switcher builds that wrote the
+    // service without Claude Code's account attribute.
+    let fallback = Command::new("security")
+        .args(["find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"])
+        .output()
+        .map_err(|e| format!("读取 Keychain 失败: {e}"))?;
+    if fallback.status.success() {
+        let text = String::from_utf8_lossy(&fallback.stdout).trim_end().to_string();
         return Ok(Some(text));
     }
 
@@ -434,6 +482,7 @@ fn switch_clash_node_internal(group: &str, node: &str) -> Result<ClashSwitchResu
 }
 
 fn write_keychain_password(password: &str) -> Result<(), String> {
+    let username = current_username();
     loop {
         let output = Command::new("security")
             .args(["delete-generic-password", "-s", KEYCHAIN_SERVICE])
@@ -446,12 +495,13 @@ fn write_keychain_password(password: &str) -> Result<(), String> {
 
     let output = Command::new("security")
         .arg("add-generic-password")
+        .arg("-U")
         .arg("-a")
-        .arg("Claude Code")
+        .arg(username)
         .arg("-s")
         .arg(KEYCHAIN_SERVICE)
-        .arg("-w")
-        .arg(password)
+        .arg("-X")
+        .arg(hex_encode(password))
         .output()
         .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
 
@@ -470,6 +520,40 @@ fn current_snapshot() -> Result<(Option<Value>, Option<Value>, Option<String>), 
     let settings_json = read_json_optional(claude_settings_path()?)?;
     let keychain = read_keychain_password()?;
     Ok((claude_json, settings_json, keychain))
+}
+
+fn update_profile_from_snapshot(
+    profile: &mut StoredProfile,
+    claude_json: Option<Value>,
+    settings_json: Option<Value>,
+    keychain_password: Option<String>,
+) -> Result<(), String> {
+    let claude_json =
+        claude_json.ok_or_else(|| "当前没有 ~/.claude.json，无法回写当前账号快照".to_string())?;
+    if keychain_password.is_none() {
+        return Err("当前没有 Keychain Claude Code-credentials，无法回写当前账号快照".to_string());
+    }
+
+    profile.meta = extract_meta(Some(&claude_json), keychain_password.as_deref());
+    profile.claude_json = claude_json;
+    profile.settings_json = settings_json;
+    profile.keychain_password = keychain_password;
+    profile.updated_at = Utc::now();
+    Ok(())
+}
+
+fn refresh_current_profile_snapshot(store: &mut Store, target_id: &str) -> Result<(), String> {
+    let Some(current_id) = store.current_profile_id.clone() else {
+        return Ok(());
+    };
+    if current_id == target_id {
+        return Ok(());
+    }
+    let Some(profile) = store.profiles.iter_mut().find(|p| p.id == current_id) else {
+        return Ok(());
+    };
+    let (claude_json, settings_json, keychain_password) = current_snapshot()?;
+    update_profile_from_snapshot(profile, claude_json, settings_json, keychain_password)
 }
 
 fn create_backup_with_label(label: &str) -> Result<BackupResult, String> {
@@ -518,6 +602,17 @@ fn get_status() -> Result<ClaudeStatus, String> {
     }
     if legacy_credentials_path()?.exists() {
         warnings.push("发现 ~/.claude/.credentials.json，请确认是否为旧版残留".to_string());
+    }
+    let auth_envs = AUTH_ENV_KEYS
+        .iter()
+        .filter(|key| std::env::var_os(key).is_some())
+        .copied()
+        .collect::<Vec<_>>();
+    if !auth_envs.is_empty() {
+        warnings.push(format!(
+            "检测到认证环境变量 {}，Claude Code 可能会忽略 Keychain OAuth，切号可能对当前环境无效",
+            auth_envs.join(", ")
+        ));
     }
 
     Ok(ClaudeStatus {
@@ -596,6 +691,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         clash: profile.clash.clone(),
         is_current: false,
     };
+    store.current_profile_id = Some(profile.id.clone());
     store.profiles.push(profile);
     save_store(&store)?;
     Ok(summary)
@@ -627,13 +723,17 @@ fn merge_claude_json(current: Option<Value>, saved: &Value) -> Value {
 #[tauri::command]
 fn switch_profile(id: String) -> Result<SwitchResult, String> {
     let mut store = load_store()?;
+    if !store.profiles.iter().any(|p| p.id == id) {
+        return Err("找不到这个账号快照".to_string());
+    }
+    let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
+    refresh_current_profile_snapshot(&mut store, &id)?;
     let idx = store
         .profiles
         .iter()
         .position(|p| p.id == id)
         .ok_or_else(|| "找不到这个账号快照".to_string())?;
     let profile = store.profiles[idx].clone();
-    let backup = create_backup_with_label(&format!("before-switch-to-{}", profile.name))?;
 
     let clash_result = if let Some(binding) = &profile.clash {
         if binding.enabled {
