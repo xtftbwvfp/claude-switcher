@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Archive,
+  Activity,
+  BarChart3,
   CheckCircle2,
   Clock,
   Database,
@@ -17,6 +19,7 @@ import {
   Router,
   RotateCcw,
   ShieldAlert,
+  Signal,
   Trash2,
   UserRound,
 } from 'lucide-react';
@@ -111,6 +114,41 @@ interface ClashSwitchResult {
   verified: boolean;
 }
 
+interface TokenTotals {
+  input_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
+interface UsageWindow {
+  label: string;
+  totals: TokenTotals;
+  message_count: number;
+  reset_at?: string | null;
+}
+
+interface DailyUsage {
+  date: string;
+  totals: TokenTotals;
+  message_count: number;
+}
+
+interface ClaudeUsageSnapshot {
+  updated_at: string;
+  scanned_files: number;
+  scanned_messages: number;
+  latest_message_at?: string | null;
+  session: UsageWindow;
+  weekly: UsageWindow;
+  today: UsageWindow;
+  last_30_days: UsageWindow;
+  daily: DailyUsage[];
+  top_model?: string | null;
+  warnings: string[];
+}
+
 type BusyAction =
   | 'refresh'
   | 'capture'
@@ -172,6 +210,32 @@ function dateLabel(value?: string | null) {
   return fmt.format(new Date(value));
 }
 
+function relativeTime(value?: string | null) {
+  if (!value) return '无记录';
+  const diff = new Date(value).getTime() - Date.now();
+  const abs = Math.abs(diff);
+  const minutes = Math.round(abs / 60000);
+  if (minutes < 1) return diff >= 0 ? '马上' : '刚刚';
+  if (minutes < 60) return diff >= 0 ? `${minutes} 分钟后` : `${minutes} 分钟前`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return diff >= 0 ? `${hours} 小时后` : `${hours} 小时前`;
+  const days = Math.round(hours / 24);
+  return diff >= 0 ? `${days} 天后` : `${days} 天前`;
+}
+
+function compactNumber(value?: number | null) {
+  const next = value ?? 0;
+  if (next >= 1_000_000_000) return `${(next / 1_000_000_000).toFixed(next >= 10_000_000_000 ? 0 : 1)}B`;
+  if (next >= 1_000_000) return `${(next / 1_000_000).toFixed(next >= 10_000_000 ? 0 : 1)}M`;
+  if (next >= 1_000) return `${(next / 1_000).toFixed(next >= 10_000 ? 0 : 1)}K`;
+  return `${next}`;
+}
+
+function usagePercent(window: UsageWindow | undefined, max: number) {
+  if (!window || max <= 0) return 0;
+  return Math.max(3, Math.min(100, (window.totals.total_tokens / max) * 100));
+}
+
 function StatusPill({ ok, label }: { ok: boolean; label: string }) {
   return <span className={ok ? 'pill ok' : 'pill muted'}>{label}</span>;
 }
@@ -185,9 +249,67 @@ function Field({ label, value }: { label: string; value?: string | null }) {
   );
 }
 
+function StatusIcon({
+  ok,
+  label,
+  detail,
+}: {
+  ok: boolean;
+  label: string;
+  detail: string;
+}) {
+  return (
+    <div className={ok ? 'status-icon ok' : 'status-icon warn'}>
+      <span>{ok ? <CheckCircle2 /> : <ShieldAlert />}</span>
+      <div>
+        <strong>{label}</strong>
+        <em>{detail}</em>
+      </div>
+    </div>
+  );
+}
+
+function UsageRow({ item, max }: { item: UsageWindow; max: number }) {
+  return (
+    <div className="usage-row">
+      <div className="usage-row-head">
+        <strong>{item.label}</strong>
+        <span>{compactNumber(item.totals.total_tokens)} token</span>
+      </div>
+      <div className="usage-bar">
+        <span style={{ width: `${usagePercent(item, max)}%` }} />
+      </div>
+      <div className="usage-row-foot">
+        <span>{item.message_count} 条 assistant usage</span>
+        <span>{item.reset_at ? `${relativeTime(item.reset_at)}重置` : '无重置估算'}</span>
+      </div>
+    </div>
+  );
+}
+
+function emptyTotals(): TokenTotals {
+  return {
+    input_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    output_tokens: 0,
+    total_tokens: 0,
+  };
+}
+
+function fallbackWindow(label: string): UsageWindow {
+  return {
+    label,
+    totals: emptyTotals(),
+    message_count: 0,
+    reset_at: null,
+  };
+}
+
 function App() {
   const [status, setStatus] = useState<ClaudeStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
+  const [usage, setUsage] = useState<ClaudeUsageSnapshot | null>(null);
   const [name, setName] = useState('');
   const [notes, setNotes] = useState('');
   const [toast, setToast] = useState<string | null>(null);
@@ -212,6 +334,19 @@ function App() {
         invoke<ProfileSummary[]>('list_profiles'),
         invoke<BackupSummary[]>('list_backups'),
       ]);
+      const nextUsage = await invoke<ClaudeUsageSnapshot>('get_claude_usage').catch((err) => ({
+        updated_at: new Date().toISOString(),
+        scanned_files: 0,
+        scanned_messages: 0,
+        latest_message_at: null,
+        session: { label: '近 5 小时', totals: emptyTotals(), message_count: 0, reset_at: null },
+        weekly: { label: '近 7 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+        today: { label: '今天', totals: emptyTotals(), message_count: 0, reset_at: null },
+        last_30_days: { label: '近 30 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+        daily: [],
+        top_model: null,
+        warnings: [String(err)],
+      }));
       const nextClashStatus = await invoke<ClashStatus>('get_clash_status').catch((err) => ({
         available: false,
         controller: 'http://127.0.0.1:9090',
@@ -222,6 +357,7 @@ function App() {
       setStatus(nextStatus);
       setProfiles(nextProfiles);
       setBackups(nextBackups);
+      setUsage(nextUsage);
       setClashStatus(nextClashStatus);
 
       // 遥测模式：get_status 始终带 telemetry_mode（后端非 Option 字段）。
@@ -347,6 +483,14 @@ function App() {
   };
 
   const canCapture = name.trim().length > 0 && !busy;
+  const usageMax = Math.max(
+    usage?.session.totals.total_tokens ?? 0,
+    usage?.weekly.totals.total_tokens ?? 0,
+    usage?.today.totals.total_tokens ?? 0,
+    usage?.last_30_days.totals.total_tokens ?? 0,
+    1,
+  );
+  const dailyMax = Math.max(...(usage?.daily ?? []).map((item) => item.totals.total_tokens), 1);
 
   return (
     <main className="app">
@@ -423,6 +567,28 @@ function App() {
               ))}
             </div>
           )}
+          <div className="status-icons">
+            <StatusIcon
+              ok={!!status?.meta.has_oauth_account}
+              label="账号"
+              detail={status?.meta.email ? shortId(status.meta.email) : '未读取'}
+            />
+            <StatusIcon
+              ok={!!status?.keychain_exists && !!status?.keychain_parse_ok}
+              label="Keychain"
+              detail={status?.keychain_exists ? 'OAuth 已保存' : '未发现'}
+            />
+            <StatusIcon
+              ok={!!clashStatus?.available}
+              label="Auto-Claude"
+              detail={clashStatus?.now || '未连接'}
+            />
+            <StatusIcon
+              ok={!!usage?.scanned_messages}
+              label="额度"
+              detail={usage ? `${compactNumber(usage.session.totals.total_tokens)} / 5h` : '读取中'}
+            />
+          </div>
         </div>
 
         <div className="panel capture-panel">
@@ -484,6 +650,66 @@ function App() {
             <RefreshCw />
             刷新 Clash 状态
           </button>
+        </div>
+
+        <div className="panel usage-panel">
+          <div className="panel-title">
+            <BarChart3 />
+            <span>Claude 用量</span>
+          </div>
+          <div className="usage-hero">
+            <div>
+              <span>更新于 {relativeTime(usage?.updated_at)}</span>
+              <strong>{compactNumber(usage?.session.totals.total_tokens)} token</strong>
+            </div>
+            <Signal />
+          </div>
+          <div className="usage-grid">
+            <UsageRow item={usage?.session ?? fallbackWindow('近 5 小时')} max={usageMax} />
+            <UsageRow item={usage?.weekly ?? fallbackWindow('近 7 天')} max={usageMax} />
+          </div>
+          <div className="usage-stats">
+            <div>
+              <span>今天</span>
+              <strong>{compactNumber(usage?.today.totals.total_tokens)}</strong>
+            </div>
+            <div>
+              <span>近 30 天</span>
+              <strong>{compactNumber(usage?.last_30_days.totals.total_tokens)}</strong>
+            </div>
+            <div>
+              <span>常用模型</span>
+              <strong>{usage?.top_model || '暂无'}</strong>
+            </div>
+            <div>
+              <span>日志</span>
+              <strong>{usage?.scanned_files ?? 0} 文件</strong>
+            </div>
+          </div>
+          <div className="daily-bars" aria-label="近 30 天 token 用量">
+            {(usage?.daily ?? []).map((item) => (
+              <span
+                key={item.date}
+                title={`${item.date} · ${compactNumber(item.totals.total_tokens)} token`}
+                style={{
+                  height: `${Math.max(4, (item.totals.total_tokens / dailyMax) * 76)}px`,
+                }}
+              />
+            ))}
+          </div>
+          <p className="usage-note">
+            本地 Claude 日志估算；用于判断消耗趋势，不等同官方实时剩余额度。
+          </p>
+          {!!usage?.warnings.length && (
+            <div className="warnings compact">
+              {usage.warnings.map((warning) => (
+                <div key={warning}>
+                  <Activity />
+                  {warning}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         <div className="panel files-panel">

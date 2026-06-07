@@ -2,13 +2,14 @@ use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Command;
 use uuid::Uuid;
@@ -210,6 +211,60 @@ struct ClashSwitchResult {
     verified: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+struct TokenTotals {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+}
+
+impl TokenTotals {
+    fn add_usage(&mut self, usage: &Value) {
+        let input = number_field(usage, "input_tokens");
+        let cache_creation = number_field(usage, "cache_creation_input_tokens");
+        let cache_read = number_field(usage, "cache_read_input_tokens");
+        let output = number_field(usage, "output_tokens");
+
+        self.input_tokens += input;
+        self.cache_creation_input_tokens += cache_creation;
+        self.cache_read_input_tokens += cache_read;
+        self.output_tokens += output;
+        self.total_tokens += input + cache_creation + cache_read + output;
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UsageWindow {
+    label: String,
+    totals: TokenTotals,
+    message_count: u64,
+    reset_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DailyUsage {
+    date: String,
+    totals: TokenTotals,
+    message_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClaudeUsageSnapshot {
+    updated_at: DateTime<Utc>,
+    scanned_files: usize,
+    scanned_messages: u64,
+    latest_message_at: Option<DateTime<Utc>>,
+    session: UsageWindow,
+    weekly: UsageWindow,
+    today: UsageWindow,
+    last_30_days: UsageWindow,
+    daily: Vec<DailyUsage>,
+    top_model: Option<String>,
+    warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ClashRuntimeConfig {
     controller: String,
@@ -323,9 +378,8 @@ fn load_store() -> Result<Store, String> {
     // 旧明文（不以 "enc:v1:" 开头）由 decrypt_secret 原样返回；解密失败返回清晰错误。
     for profile in &mut store.profiles {
         if let Some(enc) = profile.keychain_password.take() {
-            let plain = decrypt_secret(&enc).map_err(|e| {
-                format!("解密账号「{}」的 Keychain 凭据失败: {e}", profile.name)
-            })?;
+            let plain = decrypt_secret(&enc)
+                .map_err(|e| format!("解密账号「{}」的 Keychain 凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(plain);
         }
     }
@@ -342,9 +396,8 @@ fn save_store(store: &Store) -> Result<(), String> {
     let mut to_persist = store.clone();
     for profile in &mut to_persist.profiles {
         if let Some(plain) = profile.keychain_password.take() {
-            let enc = encrypt_keychain_field(&plain).map_err(|e| {
-                format!("加密账号「{}」的 Keychain 凭据失败: {e}", profile.name)
-            })?;
+            let enc = encrypt_keychain_field(&plain)
+                .map_err(|e| format!("加密账号「{}」的 Keychain 凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(enc);
         }
     }
@@ -365,6 +418,245 @@ fn string_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
         cur = cur.get(*key)?;
     }
     cur.as_str()
+}
+
+fn number_field(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn claude_projects_dir() -> Result<PathBuf, String> {
+    Ok(claude_dir()?.join("projects"))
+}
+
+fn collect_jsonl_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(dir).map_err(|e| format!("读取 Claude 日志目录失败: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_scan_usage_file(path: &PathBuf, cutoff: DateTime<Utc>) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return true;
+    };
+    let modified: DateTime<Utc> = modified.into();
+    modified >= cutoff
+}
+
+fn usage_window(
+    label: &str,
+    totals: TokenTotals,
+    message_count: u64,
+    reset_at: Option<DateTime<Utc>>,
+) -> UsageWindow {
+    UsageWindow {
+        label: label.to_string(),
+        totals,
+        message_count,
+        reset_at,
+    }
+}
+
+fn add_daily_usage(
+    daily: &mut BTreeMap<String, (TokenTotals, u64)>,
+    timestamp: DateTime<Utc>,
+    usage: &Value,
+) {
+    let key = timestamp.date_naive().to_string();
+    let (totals, count) = daily.entry(key).or_default();
+    totals.add_usage(usage);
+    *count += 1;
+}
+
+fn estimate_reset_at(earliest: Option<DateTime<Utc>>, window: Duration) -> Option<DateTime<Utc>> {
+    earliest.map(|value| value + window)
+}
+
+fn update_earliest(target: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
+    if target.map(|current| timestamp < current).unwrap_or(true) {
+        *target = Some(timestamp);
+    }
+}
+
+fn model_from_message(message: &Value) -> Option<String> {
+    let model = string_field(message, &["model"])?;
+    let clean = model.trim();
+    if clean.is_empty() || clean == "<synthetic>" {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
+    let now = Utc::now();
+    let session_window = Duration::hours(5);
+    let weekly_window = Duration::days(7);
+    let month_window = Duration::days(30);
+    let session_cutoff = now - session_window;
+    let weekly_cutoff = now - weekly_window;
+    let month_cutoff = now - month_window;
+    let today = now.date_naive();
+
+    let mut files = Vec::new();
+    collect_jsonl_files(&claude_projects_dir()?, &mut files)?;
+    files.retain(|path| should_scan_usage_file(path, month_cutoff));
+
+    let mut session_totals = TokenTotals::default();
+    let mut weekly_totals = TokenTotals::default();
+    let mut today_totals = TokenTotals::default();
+    let mut month_totals = TokenTotals::default();
+    let mut session_messages = 0;
+    let mut weekly_messages = 0;
+    let mut today_messages = 0;
+    let mut month_messages = 0;
+    let mut scanned_messages = 0;
+    let mut latest_message_at: Option<DateTime<Utc>> = None;
+    let mut earliest_session: Option<DateTime<Utc>> = None;
+    let mut earliest_weekly: Option<DateTime<Utc>> = None;
+    let mut earliest_today: Option<DateTime<Utc>> = None;
+    let mut earliest_month: Option<DateTime<Utc>> = None;
+    let mut daily: BTreeMap<String, (TokenTotals, u64)> = BTreeMap::new();
+    let mut model_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut warnings = Vec::new();
+
+    for path in &files {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) => {
+                warnings.push(format!("跳过无法读取的日志文件: {e}"));
+                continue;
+            }
+        };
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                continue;
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(timestamp_raw) = string_field(&value, &["timestamp"]) else {
+                continue;
+            };
+            let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp_raw) else {
+                continue;
+            };
+            let timestamp = timestamp.with_timezone(&Utc);
+            if timestamp < month_cutoff {
+                continue;
+            }
+
+            let message = value.get("message").unwrap_or(&value);
+            let Some(usage) = message.get("usage").or_else(|| value.get("usage")) else {
+                continue;
+            };
+            if !usage.is_object() {
+                continue;
+            }
+
+            scanned_messages += 1;
+            if latest_message_at
+                .map(|current| timestamp > current)
+                .unwrap_or(true)
+            {
+                latest_message_at = Some(timestamp);
+            }
+            if let Some(model) = model_from_message(message) {
+                *model_counts.entry(model).or_default() += 1;
+            }
+
+            month_totals.add_usage(usage);
+            month_messages += 1;
+            update_earliest(&mut earliest_month, timestamp);
+            add_daily_usage(&mut daily, timestamp, usage);
+
+            if timestamp >= weekly_cutoff {
+                weekly_totals.add_usage(usage);
+                weekly_messages += 1;
+                update_earliest(&mut earliest_weekly, timestamp);
+            }
+            if timestamp >= session_cutoff {
+                session_totals.add_usage(usage);
+                session_messages += 1;
+                update_earliest(&mut earliest_session, timestamp);
+            }
+            if timestamp.date_naive() == today {
+                today_totals.add_usage(usage);
+                today_messages += 1;
+                update_earliest(&mut earliest_today, timestamp);
+            }
+        }
+    }
+
+    let seen_days: BTreeSet<String> = daily.keys().cloned().collect();
+    let mut daily_rows = Vec::new();
+    for offset in (0..30).rev() {
+        let date = (today - Duration::days(offset)).to_string();
+        let (totals, message_count) = daily.remove(&date).unwrap_or_default();
+        daily_rows.push(DailyUsage {
+            date,
+            totals,
+            message_count,
+        });
+    }
+    if seen_days.is_empty() {
+        warnings.push("没有从 ~/.claude/projects 读取到最近 30 天的 usage 记录".to_string());
+    }
+
+    let top_model = model_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(model, _)| model);
+
+    Ok(ClaudeUsageSnapshot {
+        updated_at: now,
+        scanned_files: files.len(),
+        scanned_messages,
+        latest_message_at,
+        session: usage_window(
+            "近 5 小时",
+            session_totals,
+            session_messages,
+            estimate_reset_at(earliest_session, session_window),
+        ),
+        weekly: usage_window(
+            "近 7 天",
+            weekly_totals,
+            weekly_messages,
+            estimate_reset_at(earliest_weekly, weekly_window),
+        ),
+        today: usage_window(
+            "今天",
+            today_totals,
+            today_messages,
+            estimate_reset_at(earliest_today, Duration::days(1)),
+        ),
+        last_30_days: usage_window(
+            "近 30 天",
+            month_totals,
+            month_messages,
+            estimate_reset_at(earliest_month, month_window),
+        ),
+        daily: daily_rows,
+        top_model,
+        warnings,
+    })
 }
 
 fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) -> ProfileMeta {
@@ -439,7 +731,9 @@ fn read_keychain_password() -> Result<Option<String>, String> {
         .map_err(|e| format!("读取 Keychain 失败: {e}"))?;
 
     if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+        let text = String::from_utf8_lossy(&output.stdout)
+            .trim_end()
+            .to_string();
         return Ok(Some(text));
     }
 
@@ -450,12 +744,16 @@ fn read_keychain_password() -> Result<Option<String>, String> {
         .output()
         .map_err(|e| format!("读取 Keychain 失败: {e}"))?;
     if fallback.status.success() {
-        let text = String::from_utf8_lossy(&fallback.stdout).trim_end().to_string();
+        let text = String::from_utf8_lossy(&fallback.stdout)
+            .trim_end()
+            .to_string();
         return Ok(Some(text));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("could not be found") || stderr.contains("The specified item could not be found") {
+    if stderr.contains("could not be found")
+        || stderr.contains("The specified item could not be found")
+    {
         return Ok(None);
     }
     Ok(None)
@@ -709,7 +1007,11 @@ fn switch_clash_node_internal(group: &str, node: &str) -> Result<ClashSwitchResu
         return Err(format!("节点「{node}」不在「{group}」组里"));
     }
 
-    clash_api("PUT", &clash_group_path(group), Some(json!({ "name": node })))?;
+    clash_api(
+        "PUT",
+        &clash_group_path(group),
+        Some(json!({ "name": node })),
+    )?;
     let after = read_clash_group(group)?;
     let now = string_field(&after, &["now"]).map(ToOwned::to_owned);
     Ok(ClashSwitchResult {
@@ -730,8 +1032,7 @@ fn keychain_write(account: &str, service: &str, value: &str) -> Result<(), Strin
     use std::process::Stdio;
 
     let hex = hex_encode(value);
-    let command =
-        format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X {hex}\n");
+    let command = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X {hex}\n");
     // security -i 的 fgets 缓冲是 4096B，留 64B 余量。
     const STDIN_LINE_LIMIT: usize = 4096 - 64;
 
@@ -939,10 +1240,7 @@ fn apply_account_material(
         if failures.is_empty() {
             format!("{reason}；已回滚到操作前状态")
         } else {
-            format!(
-                "{reason}；尝试回滚但部分步骤失败：{}",
-                failures.join("；")
-            )
+            format!("{reason}；尝试回滚但部分步骤失败：{}", failures.join("；"))
         }
     }
 
@@ -1268,9 +1566,7 @@ fn prune_backups(keep: usize) {
     let mut files: Vec<(String, std::time::SystemTime, PathBuf)> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
-        })
+        .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json"))
         .map(|path| {
             let name = path
                 .file_name()
@@ -1648,7 +1944,9 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     // 已过事务回滚保护区、账号材料已成功落盘——隐私 env 注入失败属非关键，best-effort：
     // 只记 warning，不让整个切号返回 Err（否则会出现「其实已切但 UI 报失败」的半成品态）。
     if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
-        warnings.push(format!("隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"));
+        warnings.push(format!(
+            "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
+        ));
     }
 
     store.current_profile_id = Some(profile.id.clone());
@@ -1668,6 +1966,11 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
 #[tauri::command]
 fn get_clash_status() -> Result<ClashStatus, String> {
     Ok(clash_status_for_group(DEFAULT_CLASH_GROUP))
+}
+
+#[tauri::command]
+fn get_claude_usage() -> Result<ClaudeUsageSnapshot, String> {
+    claude_usage_snapshot()
 }
 
 #[tauri::command]
@@ -1890,13 +2193,20 @@ fn restore_backup(id: String) -> Result<RestoreResult, String> {
 
     // FullReplace 语义：缺失的项不是「跳过」而是「删除/清空」，把告警措辞改成回滚语义。
     if claude_json.is_none() {
-        warnings.push("备份缺少 claude_json，将删除当前 ~/.claude.json（完整还原到备份时刻）".to_string());
+        warnings.push(
+            "备份缺少 claude_json，将删除当前 ~/.claude.json（完整还原到备份时刻）".to_string(),
+        );
     }
     if settings_json.is_none() {
-        warnings.push("备份缺少 settings_json，将删除当前 ~/.claude/settings.json（完整还原到备份时刻）".to_string());
+        warnings.push(
+            "备份缺少 settings_json，将删除当前 ~/.claude/settings.json（完整还原到备份时刻）"
+                .to_string(),
+        );
     }
     if keychain_password.is_none() {
-        warnings.push("备份缺少 keychain_password，将清空当前 Keychain（完整还原到备份时刻）".to_string());
+        warnings.push(
+            "备份缺少 keychain_password，将清空当前 Keychain（完整还原到备份时刻）".to_string(),
+        );
     }
 
     // 事务化恢复：用刚创建的 before-restore 备份做回滚源，与 switch_profile 走同一 helper，
@@ -1918,7 +2228,9 @@ fn restore_backup(id: String) -> Result<RestoreResult, String> {
     // 隐私 env 注入失败属非关键，best-effort：只记 warning，不让恢复返回 Err。
     let store = load_store()?;
     if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
-        warnings.push(format!("隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"));
+        warnings.push(format!(
+            "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
+        ));
     }
 
     Ok(RestoreResult {
@@ -1949,13 +2261,22 @@ fn open_data_dir() -> Result<(), String> {
 fn inspect_local_files() -> Result<BTreeMap<String, bool>, String> {
     let mut map = BTreeMap::new();
     map.insert("~/.claude.json".to_string(), claude_json_path()?.exists());
-    map.insert("~/.claude/settings.json".to_string(), claude_settings_path()?.exists());
+    map.insert(
+        "~/.claude/settings.json".to_string(),
+        claude_settings_path()?.exists(),
+    );
     map.insert(
         "~/.claude/.credentials.json".to_string(),
         legacy_credentials_path()?.exists(),
     );
-    map.insert("Keychain Claude Code-credentials".to_string(), read_keychain_password()?.is_some());
-    map.insert("~/.claude-switcher/store.private.json".to_string(), store_path()?.exists());
+    map.insert(
+        "Keychain Claude Code-credentials".to_string(),
+        read_keychain_password()?.is_some(),
+    );
+    map.insert(
+        "~/.claude-switcher/store.private.json".to_string(),
+        store_path()?.exists(),
+    );
     Ok(map)
 }
 
@@ -1969,6 +2290,7 @@ pub fn run() {
             capture_current_profile,
             switch_profile,
             get_clash_status,
+            get_claude_usage,
             switch_clash_node,
             switch_profile_clash_node,
             set_profile_clash_binding,
