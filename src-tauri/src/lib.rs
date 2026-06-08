@@ -2930,7 +2930,9 @@ fn get_status() -> Result<ClaudeStatus, String> {
         .map(|raw| serde_json::from_str::<Value>(raw).is_ok())
         .unwrap_or(false);
     let mut meta = extract_meta(claude_json.as_ref(), keychain.as_deref());
-    fill_meta_from_saved_profile(&mut meta, &store);
+    if store.pending_new_account.is_none() {
+        fill_meta_from_saved_profile(&mut meta, &store);
+    }
     let mut warnings = Vec::new();
     let _ = apply_oauth_profile(&mut meta, keychain.as_deref());
 

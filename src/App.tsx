@@ -288,7 +288,13 @@ function shortId(value?: string | null) {
 }
 
 function statusAccountLabel(status?: ClaudeStatus | null) {
+  if (status?.pending_new_account) return `待登录：${status.pending_new_account.name}`;
   return status?.meta.email ? shortId(status.meta.email) : status?.current_profile_name || '未发现';
+}
+
+function statusOrganizationLabel(status?: ClaudeStatus | null) {
+  if (status?.pending_new_account) return '等待手动完成 Claude Code OAuth';
+  return status?.meta.organization_name || '未读取到组织名';
 }
 
 function dateLabel(value?: string | null) {
@@ -850,7 +856,7 @@ function App() {
           </div>
           <div className="identity">
             <strong>{statusAccountLabel(status)}</strong>
-            <span>{status?.meta.organization_name || '未读取到组织名'}</span>
+            <span>{statusOrganizationLabel(status)}</span>
           </div>
           <div className="pills">
             <StatusPill ok={!!status?.claude_json_exists} label="~/.claude.json" />
