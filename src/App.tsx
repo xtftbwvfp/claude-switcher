@@ -1225,10 +1225,10 @@ function App() {
                   <button
                     className="primary"
                     onClick={() => switchTo(profile.id)}
-                    disabled={!!busy || currentProfile?.id === profile.id}
+                    disabled={!!busy}
                   >
                     {busy === 'switch' ? <Loader2 className="spin" /> : <CheckCircle2 />}
-                    切换
+                    {currentProfile?.id === profile.id ? '重新应用' : '切换'}
                   </button>
                   <button className="danger" onClick={() => remove(profile.id, profile.name)} disabled={!!busy}>
                     <Trash2 />
