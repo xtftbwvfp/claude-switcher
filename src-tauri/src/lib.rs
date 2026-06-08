@@ -160,12 +160,21 @@ struct ClaudeStatus {
     settings_json_path: String,
     data_dir: String,
     backup_dir: String,
+    session_isolation: SessionIsolationStatus,
     profile_count: usize,
     current_profile_id: Option<String>,
     current_profile_name: Option<String>,
     // 当前遥测去关联模式（"default"/"disableTelemetry"/"essentialOnly"）。
     telemetry_mode: TelemetryMode,
     warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionIsolationStatus {
+    enabled: bool,
+    live_path: String,
+    target_path: Option<String>,
+    current_profile_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -329,6 +338,14 @@ fn backups_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("backups"))
 }
 
+fn session_profiles_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("session-profiles"))
+}
+
+fn session_backups_dir() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("session-backups"))
+}
+
 fn clash_verge_dir() -> Result<PathBuf, String> {
     Ok(home_dir()?.join("Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"))
 }
@@ -345,6 +362,8 @@ fn clash_config_candidates() -> Result<Vec<PathBuf>, String> {
 fn ensure_app_dirs() -> Result<(), String> {
     fs::create_dir_all(app_data_dir()?).map_err(|e| e.to_string())?;
     fs::create_dir_all(backups_dir()?).map_err(|e| e.to_string())?;
+    fs::create_dir_all(session_profiles_dir()?).map_err(|e| e.to_string())?;
+    fs::create_dir_all(session_backups_dir()?).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -460,6 +479,165 @@ fn number_field(value: &Value, key: &str) -> u64 {
 
 fn claude_projects_dir() -> Result<PathBuf, String> {
     Ok(claude_dir()?.join("projects"))
+}
+
+fn profile_sessions_dir(profile_id: &str) -> Result<PathBuf, String> {
+    Ok(session_profiles_dir()?.join(profile_id).join("projects"))
+}
+
+fn path_is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn path_exists_or_symlink(path: &Path) -> bool {
+    path.exists() || path_is_symlink(path)
+}
+
+fn backup_label(label: &str) -> String {
+    label
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn move_path_to_session_backup(path: &Path, label: &str) -> Result<PathBuf, String> {
+    fs::create_dir_all(session_backups_dir()?).map_err(|e| e.to_string())?;
+    let backup_name = format!(
+        "{}-{}-{}",
+        Utc::now().format("%Y%m%d%H%M%S"),
+        backup_label(label),
+        Uuid::new_v4()
+    );
+    let backup_path = session_backups_dir()?.join(backup_name);
+    fs::rename(path, &backup_path).map_err(|e| format!("移动 session 目录到备份失败: {e}"))?;
+    Ok(backup_path)
+}
+
+#[cfg(unix)]
+fn link_profile_sessions(target: &Path, live: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+    symlink(target, live).map_err(|e| format!("创建 session 隔离链接失败: {e}"))
+}
+
+#[cfg(not(unix))]
+fn link_profile_sessions(_target: &Path, _live: &Path) -> Result<(), String> {
+    Err("当前平台暂不支持 Claude session 符号链接隔离".to_string())
+}
+
+fn adopt_live_sessions_for_profile(profile_id: &str) -> Result<Vec<String>, String> {
+    ensure_app_dirs()?;
+    let live = claude_projects_dir()?;
+    let target = profile_sessions_dir(profile_id)?;
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    if !path_exists_or_symlink(&live) {
+        fs::create_dir_all(&target).map_err(|e| format!("创建 profile session 目录失败: {e}"))?;
+        return Ok(Vec::new());
+    }
+
+    if path_is_symlink(&live) {
+        let linked_to = fs::read_link(&live).map_err(|e| format!("读取 session 链接失败: {e}"))?;
+        if linked_to == target {
+            fs::create_dir_all(&target)
+                .map_err(|e| format!("创建 profile session 目录失败: {e}"))?;
+            return Ok(Vec::new());
+        }
+        fs::create_dir_all(&target).map_err(|e| format!("创建 profile session 目录失败: {e}"))?;
+        return Ok(vec![format!(
+            "当前 ~/.claude/projects 已指向其他隔离目录（{}），未把它接管到当前账号",
+            linked_to.to_string_lossy()
+        )]);
+    }
+
+    let mut warnings = Vec::new();
+    if path_exists_or_symlink(&target) {
+        let backup_path = move_path_to_session_backup(&target, "existing-profile-projects")?;
+        warnings.push(format!(
+            "已备份目标账号原 session 目录：{}",
+            backup_path.to_string_lossy()
+        ));
+    }
+    fs::rename(&live, &target).map_err(|e| {
+        format!(
+            "接管当前 ~/.claude/projects 到账号隔离目录失败（{} -> {}）: {e}",
+            live.to_string_lossy(),
+            target.to_string_lossy()
+        )
+    })?;
+    warnings.push(format!(
+        "已把当前 Claude sessions 接管到账号隔离目录：{}",
+        target.to_string_lossy()
+    ));
+    Ok(warnings)
+}
+
+fn activate_profile_sessions(profile_id: &str) -> Result<Vec<String>, String> {
+    ensure_app_dirs()?;
+    let live = claude_projects_dir()?;
+    let target = profile_sessions_dir(profile_id)?;
+    fs::create_dir_all(&target).map_err(|e| format!("创建 profile session 目录失败: {e}"))?;
+    if let Some(parent) = live.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    let mut warnings = Vec::new();
+    if path_is_symlink(&live) {
+        let linked_to = fs::read_link(&live).map_err(|e| format!("读取 session 链接失败: {e}"))?;
+        if linked_to == target {
+            return Ok(warnings);
+        }
+        fs::remove_file(&live).map_err(|e| format!("移除旧 session 链接失败: {e}"))?;
+    } else if live.exists() {
+        let backup_path = move_path_to_session_backup(&live, "unowned-live-projects")?;
+        warnings.push(format!(
+            "发现未归属的 ~/.claude/projects，已先备份：{}",
+            backup_path.to_string_lossy()
+        ));
+    }
+
+    link_profile_sessions(&target, &live)?;
+    warnings.push(format!(
+        "已启用账号 session 隔离：~/.claude/projects -> {}",
+        target.to_string_lossy()
+    ));
+    Ok(warnings)
+}
+
+fn session_isolation_status(
+    current_profile_id: Option<&str>,
+) -> Result<SessionIsolationStatus, String> {
+    let live = claude_projects_dir()?;
+    let current_profile_path = current_profile_id
+        .map(profile_sessions_dir)
+        .transpose()?
+        .map(|path| path.to_string_lossy().to_string());
+    let target_path = if path_is_symlink(&live) {
+        fs::read_link(&live)
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+    } else {
+        None
+    };
+    let enabled = match (&target_path, &current_profile_path) {
+        (Some(target), Some(current)) => target == current,
+        _ => false,
+    };
+    Ok(SessionIsolationStatus {
+        enabled,
+        live_path: live.to_string_lossy().to_string(),
+        target_path,
+        current_profile_path,
+    })
 }
 
 fn collect_jsonl_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -2276,6 +2454,15 @@ fn get_status() -> Result<ClaudeStatus, String> {
         );
     }
 
+    let current_profile_id_ref = store.current_profile_id.as_deref();
+    let session_isolation = session_isolation_status(current_profile_id_ref)?;
+    if store.current_profile_id.is_some() && !session_isolation.enabled {
+        warnings.push(
+            "Claude session 隔离未激活；切换一次当前账号或重新捕获账号后会自动接管 ~/.claude/projects"
+                .to_string(),
+        );
+    }
+
     Ok(ClaudeStatus {
         claude_json_exists: claude_json_path()?.exists(),
         settings_json_exists: settings_json.is_some(),
@@ -2287,6 +2474,7 @@ fn get_status() -> Result<ClaudeStatus, String> {
         settings_json_path: claude_settings_path()?.to_string_lossy().to_string(),
         data_dir: app_data_dir()?.to_string_lossy().to_string(),
         backup_dir: backups_dir()?.to_string_lossy().to_string(),
+        session_isolation,
         profile_count: store.profiles.len(),
         current_profile_name: store
             .current_profile_id
@@ -2385,7 +2573,10 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         // 下面会把 current_profile_id 指向这个新建 profile，所以它就是当前账号。
         is_current: true,
     };
-    store.current_profile_id = Some(profile.id.clone());
+    let profile_id = profile.id.clone();
+    adopt_live_sessions_for_profile(&profile_id)?;
+    activate_profile_sessions(&profile_id)?;
+    store.current_profile_id = Some(profile_id);
     store.profiles.push(profile);
     save_store(&store)?;
     Ok(summary)
@@ -2433,6 +2624,9 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
     // N1/N2：回写当前账号快照是 best-effort，不会阻断切号，只把跳过原因作为 warning 返回。
     warnings.extend(refresh_current_profile_snapshot(&mut store, &id));
+    if let Some(current_id) = store.current_profile_id.as_deref() {
+        warnings.extend(adopt_live_sessions_for_profile(current_id)?);
+    }
     let idx = store
         .profiles
         .iter()
@@ -2472,6 +2666,7 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
     }
+    warnings.extend(activate_profile_sessions(&profile.id)?);
 
     store.current_profile_id = Some(profile.id.clone());
     store.profiles[idx].last_switched_at = Some(Utc::now());

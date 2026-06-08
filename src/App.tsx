@@ -79,11 +79,19 @@ interface ClaudeStatus {
   settings_json_path: string;
   data_dir: string;
   backup_dir: string;
+  session_isolation: SessionIsolationStatus;
   profile_count: number;
   current_profile_id?: string | null;
   current_profile_name?: string | null;
   warnings: string[];
   telemetry_mode: TelemetryMode;
+}
+
+interface SessionIsolationStatus {
+  enabled: boolean;
+  live_path: string;
+  target_path?: string | null;
+  current_profile_path?: string | null;
 }
 
 interface BackupResult {
