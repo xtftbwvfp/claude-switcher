@@ -1,0 +1,49 @@
+name: macOS Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build macOS App
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npm run tauri build
+
+      - name: Upload macOS app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Switcher-app
+          path: src-tauri/target/release/bundle/macos/Claude Switcher.app
+          if-no-files-found: error
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Switcher-dmg
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
