@@ -984,10 +984,7 @@ fn claude_oauth_api(path: &str, access_token: &str, max_time_secs: u64) -> Resul
         .arg("--max-time")
         .arg(max_time_secs.to_string())
         .arg("--retry")
-        .arg("2")
-        .arg("--retry-delay")
-        .arg("1")
-        .arg("--retry-all-errors")
+        .arg("0")
         .arg("--config")
         .arg("-")
         .stdin(Stdio::piped())
@@ -1041,7 +1038,7 @@ fn cached_oauth_endpoint(
     access_token: &str,
     ttl: Duration,
 ) -> Result<Value, String> {
-    match claude_oauth_api(path, access_token, 12) {
+    match claude_oauth_api(path, access_token, 6) {
         Ok(value) => {
             if let Ok(mut guard) = cache.lock() {
                 *guard = Some(CachedOauthUsage {

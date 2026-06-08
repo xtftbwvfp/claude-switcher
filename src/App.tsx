@@ -188,6 +188,32 @@ interface ClaudeUsageSnapshot {
   warnings: string[];
 }
 
+const usageFallback = (warning: string): ClaudeUsageSnapshot => ({
+  updated_at: new Date().toISOString(),
+  scanned_files: 0,
+  scanned_messages: 0,
+  latest_message_at: null,
+  session: { label: '近 5 小时', totals: emptyTotals(), message_count: 0, reset_at: null },
+  weekly: { label: '近 7 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+  today: { label: '今天', totals: emptyTotals(), message_count: 0, reset_at: null },
+  last_30_days: { label: '近 30 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+  daily: [],
+  top_model: null,
+  warnings: [warning],
+});
+
+const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): Promise<T> => {
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => reject(new Error(`${label} 超时`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
+};
+
 type BusyAction =
   | 'refresh'
   | 'capture'
@@ -377,6 +403,7 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyAction | null>(null);
+  const [usageRefreshing, setUsageRefreshing] = useState(false);
   const [clashStatus, setClashStatus] = useState<ClashStatus | null>(null);
   const [actionWarnings, setActionWarnings] = useState<string[]>([]);
   const [backups, setBackups] = useState<BackupSummary[]>([]);
@@ -396,6 +423,20 @@ function App() {
     if (preferred) setNewAccountNode(preferred);
   }, [clashStatus?.nodes, newAccountNode]);
 
+  const refreshUsage = useCallback(async () => {
+    setUsageRefreshing(true);
+    try {
+      const nextUsage = await withTimeout(
+        invoke<ClaudeUsageSnapshot>('get_claude_usage'),
+        8000,
+        'Claude 用量刷新',
+      ).catch((err) => usageFallback(String(err)));
+      setUsage(nextUsage);
+    } finally {
+      setUsageRefreshing(false);
+    }
+  }, []);
+
   const load = useCallback(async () => {
     setBusy('refresh');
     setError(null);
@@ -413,20 +454,10 @@ function App() {
       setTelemetryMode(nextStatus.telemetry_mode);
 
       Promise.all([
-        invoke<ClaudeUsageSnapshot>('get_claude_usage').catch((err) => ({
-          updated_at: new Date().toISOString(),
-          scanned_files: 0,
-          scanned_messages: 0,
-          latest_message_at: null,
-          session: { label: '近 5 小时', totals: emptyTotals(), message_count: 0, reset_at: null },
-          weekly: { label: '近 7 天', totals: emptyTotals(), message_count: 0, reset_at: null },
-          today: { label: '今天', totals: emptyTotals(), message_count: 0, reset_at: null },
-          last_30_days: { label: '近 30 天', totals: emptyTotals(), message_count: 0, reset_at: null },
-          daily: [],
-          top_model: null,
-          warnings: [String(err)],
-        })),
-        invoke<ClashStatus>('get_clash_status').catch((err) => ({
+        withTimeout(invoke<ClaudeUsageSnapshot>('get_claude_usage'), 8000, 'Claude 用量刷新').catch((err) =>
+          usageFallback(String(err)),
+        ),
+        withTimeout(invoke<ClashStatus>('get_clash_status'), 6000, 'Clash 状态刷新').catch((err) => ({
           available: false,
           controller: 'http://127.0.0.1:9090',
           group: 'Auto-Claude',
@@ -831,8 +862,8 @@ function App() {
               <span>更新于 {relativeTime(usage?.updated_at)}</span>
               <strong>{usage ? usageLabel(usage.session) : '读取中'}</strong>
             </div>
-            <button className="usage-refresh" onClick={() => load()} disabled={!!busy} title="刷新 Claude 用量">
-              {busy === 'refresh' ? <Loader2 className="spin" /> : <RefreshCw />}
+            <button className="usage-refresh" onClick={refreshUsage} disabled={usageRefreshing} title="刷新 Claude 用量">
+              {usageRefreshing ? <Loader2 className="spin" /> : <RefreshCw />}
             </button>
           </div>
           <div className="usage-grid">
