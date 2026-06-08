@@ -853,7 +853,7 @@ fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
     let tooltip = format!(
         "Claude Switcher\n近 5 小时: {session} token\n近 7 天: {weekly} token\n常用模型: {model}\n最近记录: {latest}"
     );
-    tray.set_title(None::<String>)
+    tray.set_title(Some(String::new()))
         .map_err(|e| format!("更新菜单栏标题失败: {e}"))?;
     tray.set_tooltip(Some(tooltip))
         .map_err(|e| format!("更新菜单栏提示失败: {e}"))?;
@@ -876,27 +876,39 @@ fn position_tray_popup(
 fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) {
     let label = "tray-popup";
     if let Some(window) = app.get_webview_window(label) {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
+        let is_tray_popup = window
+            .url()
+            .map(|url| url.as_str().contains("window=tray-popup"))
+            .unwrap_or(false);
+        if !is_tray_popup {
+            let _ = window.close();
+        } else {
+            if window.is_visible().unwrap_or(false) {
+                let _ = window.hide();
+                return;
+            }
+            let _ = position_tray_popup(&window, tray_position);
+            let _ = window.show();
+            let _ = window.set_focus();
             return;
         }
-        let _ = position_tray_popup(&window, tray_position);
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
     }
 
-    match WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
-        .title("Claude Switcher Status")
-        .inner_size(360.0, 410.0)
-        .resizable(false)
-        .decorations(false)
-        .transparent(true)
-        .shadow(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .visible(false)
-        .build()
+    match WebviewWindowBuilder::new(
+        app,
+        label,
+        WebviewUrl::App("index.html?window=tray-popup".into()),
+    )
+    .title("Claude Switcher Status")
+    .inner_size(360.0, 410.0)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .shadow(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .build()
     {
         Ok(window) => {
             let window_clone = window.clone();
@@ -927,7 +939,7 @@ fn show_main_window(app: &AppHandle) {
 fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
     if let Some(tray) = app_handle.tray_by_id("main") {
-        let _ = tray.set_title(None::<String>);
+        let _ = tray.set_title(Some(String::new()));
         let _ = tray.set_tooltip(Some("Claude Switcher".to_string()));
     }
 

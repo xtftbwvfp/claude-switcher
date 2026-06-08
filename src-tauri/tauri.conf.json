@@ -25,7 +25,7 @@
       "iconPath": "icons/32x32.png",
       "iconAsTemplate": true,
       "showMenuOnLeftClick": false,
-      "title": "Claude",
+      "title": "",
       "tooltip": "Claude Switcher"
     },
     "security": {
