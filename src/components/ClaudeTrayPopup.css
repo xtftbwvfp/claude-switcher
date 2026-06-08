@@ -11,12 +11,12 @@ body.is-claude-tray-popup,
 .claude-tray-popup {
   display: flex;
   flex-direction: column;
-  gap: 13px;
+  gap: 10px;
   width: 100%;
   height: 100vh;
   box-sizing: border-box;
   overflow: hidden;
-  padding: 17px 18px;
+  padding: 14px 16px;
   color: #efeaf7;
   background:
     radial-gradient(circle at 88% 9%, rgba(63, 211, 173, 0.16), transparent 30%),
@@ -51,26 +51,26 @@ body.is-claude-tray-popup,
 .ctp-logo {
   display: grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 10px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
   color: #fff9d7;
   background: linear-gradient(135deg, #7a5be7, #a775ef);
   box-shadow: 0 8px 24px rgba(122, 91, 231, 0.42);
-  font-size: 19px;
+  font-size: 17px;
   font-weight: 900;
 }
 
 .ctp-name {
   color: #fff;
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 850;
   line-height: 1.05;
   letter-spacing: 0;
 }
 
 .ctp-subtitle {
-  margin-top: 4px;
+  margin-top: 2px;
   color: rgba(239, 234, 247, 0.46);
   font-size: 12px;
   font-weight: 700;
@@ -79,12 +79,12 @@ body.is-claude-tray-popup,
 
 .ctp-badge {
   flex: 0 0 auto;
-  padding: 6px 11px;
+  padding: 5px 10px;
   border: 1px solid rgba(248, 113, 113, 0.3);
   border-radius: 999px;
   color: #f87171;
   background: rgba(248, 113, 113, 0.08);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 850;
 }
 
@@ -99,7 +99,7 @@ body.is-claude-tray-popup,
   min-width: 0;
   margin-top: -2px;
   color: rgba(239, 234, 247, 0.62);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 720;
 }
 
@@ -133,20 +133,20 @@ body.is-claude-tray-popup,
 .ctp-cards {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
+  gap: 8px;
 }
 
 .ctp-card {
   min-width: 0;
-  padding: 13px;
+  padding: 11px;
   border: 1px solid rgba(255, 255, 255, 0.075);
-  border-radius: 11px;
+  border-radius: 10px;
   background: rgba(255, 255, 255, 0.045);
 }
 
 .ctp-card-header {
   gap: 6px;
-  margin-bottom: 9px;
+  margin-bottom: 7px;
   color: rgba(239, 234, 247, 0.45);
   font-size: 10px;
   font-weight: 900;
@@ -186,7 +186,7 @@ body.is-claude-tray-popup,
 .ctp-card-value {
   overflow: hidden;
   color: #fff;
-  font-size: 35px;
+  font-size: 30px;
   font-weight: 900;
   line-height: 1;
   text-overflow: ellipsis;
@@ -209,17 +209,17 @@ body.is-claude-tray-popup,
 
 .today-value {
   color: #ffd15d;
-  font-size: 28px;
+  font-size: 25px;
 }
 
 .token-value {
   color: #35dfaa;
-  font-size: 28px;
+  font-size: 25px;
 }
 
 .ctp-progress {
   height: 4px;
-  margin: 10px 0 7px;
+  margin: 8px 0 6px;
   overflow: hidden;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.075);
@@ -244,8 +244,7 @@ body.is-claude-tray-popup,
 }
 
 .ctp-reset,
-.ctp-token-detail,
-.ctp-note {
+.ctp-token-detail {
   color: rgba(239, 234, 247, 0.38);
   font-size: 10px;
   font-weight: 720;
@@ -279,7 +278,7 @@ body.is-claude-tray-popup,
 
 .ctp-btn {
   flex: 1;
-  min-height: 38px;
+  min-height: 34px;
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 9px;
   color: rgba(239, 234, 247, 0.7);

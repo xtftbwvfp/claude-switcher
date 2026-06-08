@@ -72,6 +72,11 @@ function compactNumber(value?: number | null) {
   return `${next}`;
 }
 
+function directTokens(totals?: TokenTotals | null) {
+  if (!totals) return 0;
+  return (totals.input_tokens ?? 0) + (totals.output_tokens ?? 0);
+}
+
 function formatCountdown(value?: string | null) {
   if (!value) return '未知';
   const diff = new Date(value).getTime() - Date.now();
@@ -181,6 +186,8 @@ export function ClaudeTrayPopup() {
   const cap = useMemo(() => capacities(data.status), [data.status]);
   const sessionLeft = remainingPercent(data.usage?.session, cap.session);
   const weeklyLeft = remainingPercent(data.usage?.weekly, cap.weekly);
+  const sessionDirectTokens = directTokens(data.usage?.session.totals);
+  const todayDirectTokens = directTokens(data.usage?.today.totals);
   const proxyOn = !!data.clash?.available;
   const keychainOk = !!data.status?.keychain_exists && !!data.status?.keychain_parse_ok;
 
@@ -232,7 +239,7 @@ export function ClaudeTrayPopup() {
             <span>TODAY</span>
           </div>
           <div className="ctp-card-value today-value">
-            {compactNumber(data.usage?.today.totals.total_tokens)}
+            {compactNumber(todayDirectTokens)}
             <span className="ctp-remaining">Tokens</span>
           </div>
           <div className="ctp-token-detail">
@@ -246,12 +253,12 @@ export function ClaudeTrayPopup() {
             <span>TOKEN USAGE</span>
           </div>
           <div className="ctp-card-value token-value">
-            {compactNumber(data.usage?.last_30_days.totals.total_tokens)}
+            {compactNumber(sessionDirectTokens)}
             <span className="ctp-remaining">Tokens</span>
           </div>
           <div className="ctp-token-detail">
-            In {compactNumber(data.usage?.last_30_days.totals.input_tokens)} / Out{' '}
-            {compactNumber(data.usage?.last_30_days.totals.output_tokens)}
+            In {compactNumber(data.usage?.session.totals.input_tokens)} / Out{' '}
+            {compactNumber(data.usage?.session.totals.output_tokens)}
           </div>
         </div>
       </div>
@@ -264,8 +271,6 @@ export function ClaudeTrayPopup() {
         <span>Auto-Claude</span>
         <b>{data.clash?.now || '未读取'}</b>
       </div>
-
-      <div className="ctp-note">Local log estimate. Claude has no official realtime quota API.</div>
 
       <div className="ctp-actions">
         <button className="ctp-btn primary" onClick={openDashboard}>

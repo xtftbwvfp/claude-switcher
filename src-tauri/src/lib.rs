@@ -237,7 +237,7 @@ impl TokenTotals {
         self.cache_creation_input_tokens += cache_creation;
         self.cache_read_input_tokens += cache_read;
         self.output_tokens += output;
-        self.total_tokens += input + cache_creation + cache_read + output;
+        self.total_tokens += input + cache_creation + output;
     }
 }
 
@@ -452,6 +452,12 @@ fn collect_jsonl_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), St
 }
 
 fn should_scan_usage_file(path: &PathBuf, cutoff: DateTime<Utc>) -> bool {
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "subagents")
+    {
+        return false;
+    }
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
@@ -497,6 +503,12 @@ fn update_earliest(target: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>)
     }
 }
 
+fn update_latest(target: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
+    if target.map(|current| timestamp > current).unwrap_or(true) {
+        *target = Some(timestamp);
+    }
+}
+
 fn model_from_message(message: &Value) -> Option<String> {
     let model = string_field(message, &["model"])?;
     let clean = model.trim();
@@ -531,8 +543,8 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
     let mut month_messages = 0;
     let mut scanned_messages = 0;
     let mut latest_message_at: Option<DateTime<Utc>> = None;
-    let mut earliest_session: Option<DateTime<Utc>> = None;
-    let mut earliest_weekly: Option<DateTime<Utc>> = None;
+    let mut latest_session: Option<DateTime<Utc>> = None;
+    let mut latest_weekly: Option<DateTime<Utc>> = None;
     let mut earliest_today: Option<DateTime<Utc>> = None;
     let mut earliest_month: Option<DateTime<Utc>> = None;
     let mut daily: BTreeMap<String, (TokenTotals, u64)> = BTreeMap::new();
@@ -569,6 +581,16 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             }
 
             let message = value.get("message").unwrap_or(&value);
+            if value
+                .get("isSidechain")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(model) = model_from_message(message) else {
+                continue;
+            };
             let Some(usage) = message.get("usage").or_else(|| value.get("usage")) else {
                 continue;
             };
@@ -583,9 +605,7 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             {
                 latest_message_at = Some(timestamp);
             }
-            if let Some(model) = model_from_message(message) {
-                *model_counts.entry(model).or_default() += 1;
-            }
+            *model_counts.entry(model).or_default() += 1;
 
             month_totals.add_usage(usage);
             month_messages += 1;
@@ -595,12 +615,12 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             if timestamp >= weekly_cutoff {
                 weekly_totals.add_usage(usage);
                 weekly_messages += 1;
-                update_earliest(&mut earliest_weekly, timestamp);
+                update_latest(&mut latest_weekly, timestamp);
             }
             if timestamp >= session_cutoff {
                 session_totals.add_usage(usage);
                 session_messages += 1;
-                update_earliest(&mut earliest_session, timestamp);
+                update_latest(&mut latest_session, timestamp);
             }
             if timestamp.date_naive() == today {
                 today_totals.add_usage(usage);
@@ -639,13 +659,13 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             "近 5 小时",
             session_totals,
             session_messages,
-            estimate_reset_at(earliest_session, session_window),
+            estimate_reset_at(latest_session, session_window),
         ),
         weekly: usage_window(
             "近 7 天",
             weekly_totals,
             weekly_messages,
-            estimate_reset_at(earliest_weekly, weekly_window),
+            estimate_reset_at(latest_weekly, weekly_window),
         ),
         today: usage_window(
             "今天",
@@ -719,7 +739,7 @@ fn position_tray_popup(
     window: &WebviewWindow,
     tray_position: PhysicalPosition<f64>,
 ) -> Result<(), String> {
-    let popup_width = 390.0;
+    let popup_width = 360.0;
     let scale = window.scale_factor().unwrap_or(1.0);
     let x = (tray_position.x - popup_width * scale / 2.0).max(0.0) as i32;
     let y = (tray_position.y + 4.0) as i32;
@@ -741,13 +761,13 @@ fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) {
         return;
     }
 
-    let url = WebviewUrl::App("index.html".into());
-    match WebviewWindowBuilder::new(app, label, url)
+    match WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .title("Claude Switcher Status")
-        .inner_size(390.0, 540.0)
+        .inner_size(360.0, 410.0)
         .resizable(false)
         .decorations(false)
-        .shadow(false)
+        .transparent(true)
+        .shadow(true)
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
