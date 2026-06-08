@@ -449,10 +449,24 @@ select:focus {
   line-height: 1;
 }
 
-.usage-hero svg {
+.usage-refresh {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 6px;
+  color: #2f5d50;
+  background: #eee7d8;
+  border: 1px solid rgba(47, 93, 80, 0.16);
+}
+
+.usage-refresh:hover:not(:disabled) {
+  background: #e4ddcf;
+}
+
+.usage-refresh svg {
   width: 34px;
   height: 34px;
-  color: #2f5d50;
 }
 
 .usage-grid {

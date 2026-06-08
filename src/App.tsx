@@ -20,7 +20,6 @@ import {
   Router,
   RotateCcw,
   ShieldAlert,
-  Signal,
   Trash2,
   UserRound,
 } from 'lucide-react';
@@ -832,7 +831,9 @@ function App() {
               <span>更新于 {relativeTime(usage?.updated_at)}</span>
               <strong>{usage ? usageLabel(usage.session) : '读取中'}</strong>
             </div>
-            <Signal />
+            <button className="usage-refresh" onClick={() => load()} disabled={!!busy} title="刷新 Claude 用量">
+              {busy === 'refresh' ? <Loader2 className="spin" /> : <RefreshCw />}
+            </button>
           </div>
           <div className="usage-grid">
             <UsageRow item={usage?.session ?? fallbackWindow('近 5 小时')} max={usageMax} />
