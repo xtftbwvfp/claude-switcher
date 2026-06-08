@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
@@ -274,6 +274,13 @@ struct ClaudeUsageSnapshot {
 }
 
 #[derive(Debug, Clone)]
+struct UsageRecord {
+    timestamp: DateTime<Utc>,
+    model: String,
+    usage: Value,
+}
+
+#[derive(Debug, Clone)]
 struct ClashRuntimeConfig {
     controller: String,
     secret: Option<String>,
@@ -463,10 +470,8 @@ fn collect_jsonl_files(dir: &PathBuf, files: &mut Vec<PathBuf>) -> Result<(), St
 }
 
 fn should_scan_usage_file(path: &PathBuf, cutoff: DateTime<Utc>) -> bool {
-    if path
-        .components()
-        .any(|component| component.as_os_str() == "subagents")
-    {
+    let path_text = path.to_string_lossy();
+    if path_text.contains("/subagents/") || path_text.contains("CodexBar-ClaudeProbe") {
         return false;
     }
     let Ok(metadata) = fs::metadata(path) else {
@@ -639,6 +644,30 @@ fn model_from_message(message: &Value) -> Option<String> {
     }
 }
 
+fn usage_dedupe_key(path: &Path, value: &Value, message: &Value, fallback: u64) -> String {
+    let message_id = string_field(message, &["id"])
+        .or_else(|| string_field(value, &["messageId"]))
+        .or_else(|| string_field(value, &["message_id"]))
+        .or_else(|| string_field(value, &["uuid"]));
+    let request_id = string_field(value, &["requestId"])
+        .or_else(|| string_field(value, &["request_id"]))
+        .or_else(|| string_field(message, &["requestId"]))
+        .or_else(|| string_field(message, &["request_id"]));
+    match (message_id, request_id) {
+        (Some(message_id), Some(request_id)) => format!("{message_id}:{request_id}"),
+        (Some(message_id), None) => message_id.to_string(),
+        (None, Some(request_id)) => request_id.to_string(),
+        (None, None) => format!("{}:{fallback}", path.to_string_lossy()),
+    }
+}
+
+fn usage_total_for_dedupe(usage: &Value) -> u64 {
+    number_field(usage, "input_tokens")
+        + number_field(usage, "cache_creation_input_tokens")
+        + number_field(usage, "cache_read_input_tokens")
+        + number_field(usage, "output_tokens")
+}
+
 fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
     let now = Utc::now();
     let session_window = Duration::hours(5);
@@ -653,22 +682,9 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
     collect_jsonl_files(&claude_projects_dir()?, &mut files)?;
     files.retain(|path| should_scan_usage_file(path, month_cutoff));
 
-    let mut session_totals = TokenTotals::default();
-    let mut weekly_totals = TokenTotals::default();
-    let mut today_totals = TokenTotals::default();
-    let mut month_totals = TokenTotals::default();
-    let mut session_messages = 0;
-    let mut weekly_messages = 0;
-    let mut today_messages = 0;
-    let mut month_messages = 0;
     let mut scanned_messages = 0;
-    let mut latest_message_at: Option<DateTime<Utc>> = None;
-    let mut latest_session: Option<DateTime<Utc>> = None;
-    let mut latest_weekly: Option<DateTime<Utc>> = None;
-    let mut earliest_today: Option<DateTime<Utc>> = None;
-    let mut earliest_month: Option<DateTime<Utc>> = None;
-    let mut daily: BTreeMap<String, (TokenTotals, u64)> = BTreeMap::new();
-    let mut model_counts: BTreeMap<String, u64> = BTreeMap::new();
+    let mut fallback_usage_key = 0u64;
+    let mut usage_records: BTreeMap<String, UsageRecord> = BTreeMap::new();
     let mut warnings = Vec::new();
 
     for path in &files {
@@ -701,6 +717,12 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             }
 
             let message = value.get("message").unwrap_or(&value);
+            let entry_type = string_field(&value, &["type"])
+                .or_else(|| string_field(message, &["type"]))
+                .unwrap_or("");
+            if entry_type != "assistant" {
+                continue;
+            }
             if value
                 .get("isSidechain")
                 .and_then(|item| item.as_bool())
@@ -719,34 +741,74 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
             }
 
             scanned_messages += 1;
-            if latest_message_at
-                .map(|current| timestamp > current)
-                .unwrap_or(true)
-            {
-                latest_message_at = Some(timestamp);
+            fallback_usage_key += 1;
+            let key = usage_dedupe_key(path, &value, message, fallback_usage_key);
+            let should_replace = usage_records
+                .get(&key)
+                .map(|current| {
+                    timestamp >= current.timestamp
+                        || usage_total_for_dedupe(usage) > usage_total_for_dedupe(&current.usage)
+                })
+                .unwrap_or(true);
+            if should_replace {
+                usage_records.insert(
+                    key,
+                    UsageRecord {
+                        timestamp,
+                        model,
+                        usage: usage.clone(),
+                    },
+                );
             }
-            *model_counts.entry(model).or_default() += 1;
+        }
+    }
 
-            month_totals.add_usage(usage);
-            month_messages += 1;
-            update_earliest(&mut earliest_month, timestamp);
-            add_daily_usage(&mut daily, timestamp, usage);
+    let mut session_totals = TokenTotals::default();
+    let mut weekly_totals = TokenTotals::default();
+    let mut today_totals = TokenTotals::default();
+    let mut month_totals = TokenTotals::default();
+    let mut session_messages = 0;
+    let mut weekly_messages = 0;
+    let mut today_messages = 0;
+    let mut month_messages = 0;
+    let mut latest_message_at: Option<DateTime<Utc>> = None;
+    let mut latest_session: Option<DateTime<Utc>> = None;
+    let mut latest_weekly: Option<DateTime<Utc>> = None;
+    let mut earliest_today: Option<DateTime<Utc>> = None;
+    let mut earliest_month: Option<DateTime<Utc>> = None;
+    let mut daily: BTreeMap<String, (TokenTotals, u64)> = BTreeMap::new();
+    let mut model_counts: BTreeMap<String, u64> = BTreeMap::new();
 
-            if timestamp >= weekly_cutoff {
-                weekly_totals.add_usage(usage);
-                weekly_messages += 1;
-                update_latest(&mut latest_weekly, timestamp);
-            }
-            if timestamp >= session_cutoff {
-                session_totals.add_usage(usage);
-                session_messages += 1;
-                update_latest(&mut latest_session, timestamp);
-            }
-            if timestamp.date_naive() == today {
-                today_totals.add_usage(usage);
-                today_messages += 1;
-                update_earliest(&mut earliest_today, timestamp);
-            }
+    for record in usage_records.values() {
+        let timestamp = record.timestamp;
+        let usage = &record.usage;
+        if latest_message_at
+            .map(|current| timestamp > current)
+            .unwrap_or(true)
+        {
+            latest_message_at = Some(timestamp);
+        }
+        *model_counts.entry(record.model.clone()).or_default() += 1;
+
+        month_totals.add_usage(usage);
+        month_messages += 1;
+        update_earliest(&mut earliest_month, timestamp);
+        add_daily_usage(&mut daily, timestamp, usage);
+
+        if timestamp >= weekly_cutoff {
+            weekly_totals.add_usage(usage);
+            weekly_messages += 1;
+            update_latest(&mut latest_weekly, timestamp);
+        }
+        if timestamp >= session_cutoff {
+            session_totals.add_usage(usage);
+            session_messages += 1;
+            update_latest(&mut latest_session, timestamp);
+        }
+        if timestamp.date_naive() == today {
+            today_totals.add_usage(usage);
+            today_messages += 1;
+            update_earliest(&mut earliest_today, timestamp);
         }
     }
 
