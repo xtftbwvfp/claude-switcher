@@ -581,13 +581,13 @@ function App() {
         chromeProfile: newAccountChromeProfile.trim() || null,
       });
       setNewAccountProgress(88);
-      setNewAccountStep('打开 Claude 登录窗口');
+      setNewAccountStep('环境已准备，等待手动授权');
       setActionWarnings([]);
       setActionWarnings(result.warnings ?? []);
-      setToast(`已准备新号「${result.pending.name}」登录；Auto-Claude 已切到 ${result.clash.node}`);
+      setToast(`已准备新号「${result.pending.name}」环境；Auto-Claude 已切到 ${result.clash.node}`);
       await load();
       setNewAccountProgress(100);
-      setNewAccountStep('完成，可以去浏览器登录');
+      setNewAccountStep('完成。请确认 IP 后手动打开 Claude Code 授权');
       setNewAccountModalState('done');
     } catch (err) {
       setError(String(err));
@@ -781,7 +781,7 @@ function App() {
               <ShieldAlert />
               <div>
                 <strong>准备尼区新号登录</strong>
-                <span>保存当前账号、切换 Auto-Claude、清理 OAuth，并打开登录窗口。</span>
+                <span>保存当前账号、切换 Auto-Claude、清理 OAuth；不会自动打开浏览器或 Claude。</span>
               </div>
             </div>
 
@@ -829,12 +829,12 @@ function App() {
               </button>
               {newAccountModalState === 'done' ? (
                 <button className="primary" onClick={closePrepareNewAccountModal}>
-                  已打开登录，去授权
+                  已准备好，我手动授权
                 </button>
               ) : (
                 <button className="primary" onClick={prepareNewAccount} disabled={newAccountModalState === 'running'}>
                   {newAccountModalState === 'running' ? <Loader2 className="spin" /> : <ShieldAlert />}
-                  开始准备登录
+                  开始准备环境
                 </button>
               )}
             </div>
@@ -953,7 +953,7 @@ function App() {
                 <span>Chrome</span>
                 <strong>{status.pending_new_account.runtime.chrome_profile || '未绑定'}</strong>
               </div>
-              <p>在刚打开的 Claude 窗口完成 OAuth 登录后，点下面保存成正式账号。</p>
+              <p>环境已准备好。确认 IP / Chrome Profile 都正确后，手动打开 Claude Code 授权；完成 OAuth 后点下面保存成正式账号。</p>
               <button className="primary wide" onClick={finishNewAccount} disabled={!canFinishNewAccount}>
                 {busy === 'finish-new' ? <Loader2 className="spin" /> : <CheckCircle2 />}
                 登录完成后保存
@@ -1025,7 +1025,7 @@ function App() {
               </div>
               <button className="primary wide" onClick={openPrepareNewAccountModal} disabled={!canPrepareNewAccount}>
                 {busy === 'new-login' ? <Loader2 className="spin" /> : <ShieldAlert />}
-                准备并打开登录
+                准备环境，不打开登录
               </button>
             </>
           )}

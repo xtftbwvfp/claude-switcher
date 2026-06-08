@@ -24,9 +24,10 @@ English documentation is available below: [English](#english)
   - 结束正在运行的 Claude Code CLI 进程
   - 保存当前账号状态
   - 把 Clash 切到指定节点
+  - 确认节点已选中、alive，并能连到 `api.anthropic.com`
   - 清理当前 OAuth 状态
   - 为新号创建干净的本地 Claude 状态
-  - 打开干净环境下的 `claude` 登录窗口
+  - 不自动打开浏览器或 `claude`；确认 IP 后由用户手动授权
 - 显示 Claude 用量：
   - 额度百分比来自官方 Claude OAuth usage 接口
   - token 趋势来自本地 Claude Code 日志估算

@@ -1958,7 +1958,7 @@ fn assert_clash_node_ready(group: &str, node: &str) -> Result<(), String> {
     let now = string_field(&group_state, &["now"]);
     if now != Some(node) {
         return Err(format!(
-            "Auto-Claude 没有切到「{node}」，当前仍是「{}」。已停止打开登录。",
+            "Auto-Claude 没有切到「{node}」，当前仍是「{}」。已停止准备新号。",
             now.unwrap_or("未读取")
         ));
     }
@@ -1970,7 +1970,7 @@ fn assert_clash_node_ready(group: &str, node: &str) -> Result<(), String> {
         .unwrap_or(false)
     {
         return Err(format!(
-            "节点「{node}」当前不可用（Clash alive=false），已停止打开登录。"
+            "节点「{node}」当前不可用（Clash alive=false），已停止准备新号。"
         ));
     }
 
@@ -1982,7 +1982,7 @@ fn assert_clash_node_ready(group: &str, node: &str) -> Result<(), String> {
     let delay_ms = delay.get("delay").and_then(|value| value.as_u64());
     if delay_ms.unwrap_or(0) == 0 {
         return Err(format!(
-            "节点「{node}」到 api.anthropic.com 延迟测试失败，已停止打开登录。"
+            "节点「{node}」到 api.anthropic.com 延迟测试失败，已停止准备新号。"
         ));
     }
 
@@ -2918,85 +2918,6 @@ fn clean_live_account_for_new_login(
     Ok(())
 }
 
-fn shell_single_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn open_clean_claude_login_terminal(runtime: Option<&ProfileRuntimeBinding>) -> Result<(), String> {
-    let mut parts = vec![
-        "cd ~".to_string(),
-        "env".to_string(),
-        "-u ANTHROPIC_API_KEY".to_string(),
-        "-u ANTHROPIC_AUTH_TOKEN".to_string(),
-        "-u CLAUDE_CODE_OAUTH_TOKEN".to_string(),
-        "-u CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR".to_string(),
-        "-u CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR".to_string(),
-    ];
-    if let Some(proxy) = detect_clash_runtime_config().proxy {
-        parts.push(format!("HTTPS_PROXY={}", shell_single_quote(&proxy)));
-        parts.push(format!("HTTP_PROXY={}", shell_single_quote(&proxy)));
-        parts.push(format!("ALL_PROXY={}", shell_single_quote(&proxy)));
-    }
-    if let Some(runtime) = runtime {
-        if let Some(timezone) = runtime
-            .timezone
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            parts.push(format!("TZ={}", shell_single_quote(timezone.trim())));
-        }
-        if let Some(locale) = runtime
-            .locale
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            let locale = shell_single_quote(locale.trim());
-            parts.push(format!("LANG={locale}"));
-            parts.push(format!("LC_ALL={locale}"));
-        }
-    }
-    parts.push("claude".to_string());
-    let terminal_command = parts.join(" ");
-    let script = format!(
-        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
-        shell_single_quote(&terminal_command)
-    );
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|e| format!("打开 Terminal 登录窗口失败: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "打开 Terminal 登录窗口失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
-fn open_chrome_profile(profile: &str, url: &str) -> Result<(), String> {
-    let profile = profile.trim();
-    if profile.is_empty() {
-        return Ok(());
-    }
-    let output = Command::new("open")
-        .args(["-na", "Google Chrome", "--args"])
-        .arg(format!("--profile-directory={profile}"))
-        .arg(url)
-        .output()
-        .map_err(|e| format!("打开 Chrome Profile 失败: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "打开 Chrome Profile 失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
 #[tauri::command]
 fn get_status() -> Result<ClaudeStatus, String> {
     ensure_app_dirs()?;
@@ -3231,7 +3152,7 @@ fn prepare_new_account_login(
     let clash = switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
     if !clash.verified {
         return Err(format!(
-            "Auto-Claude 切换到「{clean_node}」未被 Clash 确认，已停止打开登录。"
+            "Auto-Claude 切换到「{clean_node}」未被 Clash 确认，已停止准备新号。"
         ));
     }
     assert_clash_node_ready(DEFAULT_CLASH_GROUP, clean_node)?;
@@ -3276,14 +3197,6 @@ fn prepare_new_account_login(
     warnings.extend(activate_profile_claude_local_state(&pending.id)?);
     store.pending_new_account = Some(pending.clone());
     save_store(&store)?;
-    if let Some(profile) = pending.runtime.chrome_profile.as_deref() {
-        if let Err(e) = open_chrome_profile(profile, "https://claude.ai") {
-            warnings.push(e);
-        }
-    }
-    if let Err(e) = open_clean_claude_login_terminal(Some(&pending.runtime)) {
-        warnings.push(e);
-    }
     Ok(PrepareNewAccountResult {
         pending,
         backup,
@@ -3300,8 +3213,9 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
         .clone()
         .ok_or_else(|| "没有待完成的新号登录流程".to_string())?;
     let (claude_json, settings_json, keychain_password) = current_snapshot()?;
-    let claude_json = claude_json
-        .ok_or_else(|| "当前没有 ~/.claude.json，请先在刚打开的 Claude 窗口完成登录".to_string())?;
+    let claude_json = claude_json.ok_or_else(|| {
+        "当前没有 ~/.claude.json，请先手动完成 Claude Code OAuth 登录".to_string()
+    })?;
     let keychain_password = keychain_password.ok_or_else(|| {
         "当前没有 Keychain Claude Code-credentials，请先完成 Claude OAuth 登录".to_string()
     })?;
