@@ -214,6 +214,11 @@ const withTimeout = async <T,>(promise: Promise<T>, ms: number, label: string): 
   }
 };
 
+const nextAnimationFrame = () =>
+  new Promise<void>((resolve) => {
+    window.requestAnimationFrame(() => resolve());
+  });
+
 type BusyAction =
   | 'refresh'
   | 'capture'
@@ -426,6 +431,7 @@ function App() {
   const refreshUsage = useCallback(async () => {
     setUsageRefreshing(true);
     try {
+      await nextAnimationFrame();
       const nextUsage = await withTimeout(
         invoke<ClaudeUsageSnapshot>('get_claude_usage'),
         8000,

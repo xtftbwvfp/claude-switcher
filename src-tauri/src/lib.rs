@@ -3228,8 +3228,10 @@ fn get_clash_status() -> Result<ClashStatus, String> {
 }
 
 #[tauri::command]
-fn get_claude_usage() -> Result<ClaudeUsageSnapshot, String> {
-    claude_usage_snapshot()
+async fn get_claude_usage() -> Result<ClaudeUsageSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(claude_usage_snapshot)
+        .await
+        .map_err(|e| format!("Claude 用量后台任务失败: {e}"))?
 }
 
 #[tauri::command]
