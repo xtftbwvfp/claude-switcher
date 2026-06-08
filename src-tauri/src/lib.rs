@@ -1940,8 +1940,53 @@ fn clash_group_path(group: &str) -> String {
     format!("/proxies/{}", urlencoding::encode(group))
 }
 
+fn clash_proxy_path(node: &str) -> String {
+    format!("/proxies/{}", urlencoding::encode(node))
+}
+
 fn read_clash_group(group: &str) -> Result<Value, String> {
     clash_api("GET", &clash_group_path(group), None)
+}
+
+fn read_clash_proxy(node: &str) -> Result<Value, String> {
+    clash_api("GET", &clash_proxy_path(node), None)
+}
+
+fn assert_clash_node_ready(group: &str, node: &str) -> Result<(), String> {
+    thread::sleep(StdDuration::from_millis(250));
+    let group_state = read_clash_group(group)?;
+    let now = string_field(&group_state, &["now"]);
+    if now != Some(node) {
+        return Err(format!(
+            "Auto-Claude 没有切到「{node}」，当前仍是「{}」。已停止打开登录。",
+            now.unwrap_or("未读取")
+        ));
+    }
+
+    let node_state = read_clash_proxy(node)?;
+    if !node_state
+        .get("alive")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "节点「{node}」当前不可用（Clash alive=false），已停止打开登录。"
+        ));
+    }
+
+    let delay_path = format!(
+        "{}/delay?timeout=5000&url=https%3A%2F%2Fapi.anthropic.com",
+        clash_proxy_path(node)
+    );
+    let delay = clash_api("GET", &delay_path, None)?;
+    let delay_ms = delay.get("delay").and_then(|value| value.as_u64());
+    if delay_ms.unwrap_or(0) == 0 {
+        return Err(format!(
+            "节点「{node}」到 api.anthropic.com 延迟测试失败，已停止打开登录。"
+        ));
+    }
+
+    Ok(())
 }
 
 fn clash_status_for_group(group: &str) -> ClashStatus {
@@ -2621,6 +2666,8 @@ fn claude_code_processes() -> Vec<(u32, String)> {
             }
             let is_claude_code = lower.contains("claude-code")
                 || lower.contains("claude code")
+                || lower.contains(".claude/shell-snapshots")
+                || lower.contains("claude_plugin_data")
                 || lower.split_whitespace().any(|tok| {
                     let base = tok.rsplit('/').next().unwrap_or(tok);
                     base == "claude"
@@ -3182,6 +3229,12 @@ fn prepare_new_account_login(
     let (_, settings_json, _) = current_snapshot()?;
     let rollback_from = load_backup_snapshot(&PathBuf::from(&backup.path))?;
     let clash = switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
+    if !clash.verified {
+        return Err(format!(
+            "Auto-Claude 切换到「{clean_node}」未被 Clash 确认，已停止打开登录。"
+        ));
+    }
+    assert_clash_node_ready(DEFAULT_CLASH_GROUP, clean_node)?;
     let mut runtime = default_runtime_for_profile(clean_name, Some(clean_node));
     if timezone
         .as_deref()
@@ -3297,6 +3350,23 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
     store.profiles.push(profile);
     save_store(&store)?;
     Ok(summary)
+}
+
+#[tauri::command]
+fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, String> {
+    let mut store = load_store()?;
+    if store.pending_new_account.is_none() {
+        return Err("没有待取消的新号登录流程".to_string());
+    }
+    let current_id = store.current_profile_id.clone();
+    store.pending_new_account = None;
+    save_store(&store)?;
+
+    if let Some(id) = current_id {
+        switch_profile(id).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn merge_claude_json(current: Option<Value>, saved: &Value) -> Value {
@@ -3781,6 +3851,7 @@ pub fn run() {
             capture_current_profile,
             prepare_new_account_login,
             complete_new_account_login,
+            cancel_pending_new_account_login,
             switch_profile,
             get_clash_status,
             get_claude_usage,

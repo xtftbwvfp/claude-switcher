@@ -611,6 +611,18 @@ function App() {
       return '新号已保存并绑定节点';
     });
 
+  const cancelNewAccount = () => {
+    if (!window.confirm('取消这次新号登录流程，并切回当前保存的账号快照？')) return;
+    run('switch', async () => {
+      setActionWarnings([]);
+      const result = await invoke<SwitchResult | null>('cancel_pending_new_account_login');
+      setActionWarnings(result?.warnings ?? []);
+      return result
+        ? `已取消新号流程，并切回 ${result.switched_to}`
+        : '已取消新号流程';
+    });
+  };
+
   const switchTo = (id: string) =>
     run('switch', async () => {
       setActionWarnings([]);
@@ -945,6 +957,10 @@ function App() {
               <button className="primary wide" onClick={finishNewAccount} disabled={!canFinishNewAccount}>
                 {busy === 'finish-new' ? <Loader2 className="spin" /> : <CheckCircle2 />}
                 登录完成后保存
+              </button>
+              <button className="ghost wide" onClick={cancelNewAccount} disabled={!!busy}>
+                {busy === 'switch' ? <Loader2 className="spin" /> : <RotateCcw />}
+                取消这次准备并切回当前账号
               </button>
             </div>
           ) : (
