@@ -6,6 +6,12 @@
     <title>Claude Switcher</title>
   </head>
   <body>
+    <script>
+      if (new URLSearchParams(window.location.search).get('window') === 'tray-popup') {
+        document.documentElement.classList.add('is-claude-tray-popup');
+        document.body.classList.add('is-claude-tray-popup');
+      }
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

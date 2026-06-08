@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration as StdDuration;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+use tauri::webview::PageLoadEvent;
 use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
@@ -1497,6 +1498,12 @@ fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) {
     .always_on_top(true)
     .skip_taskbar(true)
     .visible(false)
+    .on_page_load(|window, payload| {
+        if matches!(payload.event(), PageLoadEvent::Finished) {
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    })
     .build()
     {
         Ok(window) => {
@@ -1507,8 +1514,6 @@ fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) {
                 }
             });
             let _ = position_tray_popup(&window, tray_position);
-            let _ = window.show();
-            let _ = window.set_focus();
         }
         Err(error) => eprintln!("[claude-switcher] 创建菜单栏弹窗失败: {error}"),
     }
