@@ -252,7 +252,17 @@ function compactNumber(value?: number | null) {
 
 function usagePercent(window: UsageWindow | undefined, max: number) {
   if (!window || max <= 0) return 0;
+  if (typeof window.used_percent === 'number') {
+    return Math.max(3, Math.min(100, 100 - window.used_percent));
+  }
   return Math.max(3, Math.min(100, (window.totals.total_tokens / max) * 100));
+}
+
+function usageLabel(window?: UsageWindow | null) {
+  if (typeof window?.used_percent === 'number') {
+    return `${Math.round(Math.max(0, Math.min(100, 100 - window.used_percent)))}% 剩余`;
+  }
+  return `${compactNumber(window?.totals.total_tokens)} token`;
 }
 
 function StatusPill({ ok, label }: { ok: boolean; label: string }) {
@@ -293,13 +303,13 @@ function UsageRow({ item, max }: { item: UsageWindow; max: number }) {
     <div className="usage-row">
       <div className="usage-row-head">
         <strong>{item.label}</strong>
-        <span>{compactNumber(item.totals.total_tokens)} token</span>
+        <span>{usageLabel(item)}</span>
       </div>
       <div className="usage-bar">
         <span style={{ width: `${usagePercent(item, max)}%` }} />
       </div>
       <div className="usage-row-foot">
-        <span>{item.message_count} 条 assistant usage</span>
+        <span>{compactNumber(item.totals.total_tokens)} token · {item.message_count} 条 usage</span>
         <span>{item.reset_at ? `${relativeTime(item.reset_at)}重置` : '无重置估算'}</span>
       </div>
     </div>
@@ -611,9 +621,9 @@ function App() {
               detail={clashStatus?.now || '未连接'}
             />
             <StatusIcon
-              ok={!!usage?.scanned_messages}
+              ok={typeof usage?.session.used_percent === 'number' || !!usage?.scanned_messages}
               label="额度"
-              detail={usage ? `${compactNumber(usage.session.totals.total_tokens)} / 5h` : '读取中'}
+              detail={usage ? usageLabel(usage.session) : '读取中'}
             />
           </div>
         </div>
@@ -687,7 +697,7 @@ function App() {
           <div className="usage-hero">
             <div>
               <span>更新于 {relativeTime(usage?.updated_at)}</span>
-              <strong>{compactNumber(usage?.session.totals.total_tokens)} token</strong>
+              <strong>{usage ? usageLabel(usage.session) : '读取中'}</strong>
             </div>
             <Signal />
           </div>
@@ -725,7 +735,7 @@ function App() {
             ))}
           </div>
           <p className="usage-note">
-            本地 Claude 日志估算；用于判断消耗趋势，不等同官方实时剩余额度。
+            额度百分比来自官方 Claude OAuth API；token 和柱状图来自本地日志，用于判断消耗趋势。
           </p>
           {!!usage?.warnings.length && (
             <div className="warnings compact">

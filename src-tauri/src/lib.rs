@@ -277,6 +277,7 @@ struct ClaudeUsageSnapshot {
 struct ClashRuntimeConfig {
     controller: String,
     secret: Option<String>,
+    proxy: Option<String>,
 }
 
 fn home_dir() -> Result<PathBuf, String> {
@@ -428,6 +429,14 @@ fn string_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     cur.as_str()
 }
 
+fn numeric_field(value: &Value, path: &[&str]) -> Option<u64> {
+    let mut cur = value;
+    for key in path {
+        cur = cur.get(*key)?;
+    }
+    cur.as_u64()
+}
+
 fn number_field(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
@@ -514,60 +523,76 @@ fn curl_config_quote(value: &str) -> String {
         .replace(['\n', '\r'], "")
 }
 
-fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
-    let Some(raw) = read_keychain_password()? else {
-        return Err("Keychain 中没有 Claude OAuth 凭据".to_string());
-    };
+fn oauth_access_token_from_raw(raw: &str) -> Result<String, String> {
     let parsed: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("Keychain OAuth JSON 解析失败: {e}"))?;
+        serde_json::from_str(raw).map_err(|e| format!("Keychain OAuth JSON 解析失败: {e}"))?;
     let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
-    let access_token = string_field(oauth, &["accessToken"])
+    string_field(oauth, &["accessToken"])
         .or_else(|| string_field(oauth, &["access_token"]))
-        .ok_or_else(|| "Keychain OAuth 中没有 accessToken".to_string())?;
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Keychain OAuth 中没有 accessToken".to_string())
+}
 
+fn claude_oauth_api(path: &str, access_token: &str, max_time_secs: u64) -> Result<Value, String> {
+    let runtime = detect_clash_runtime_config();
+    let proxy = runtime
+        .proxy
+        .map(|value| format!("proxy = \"{}\"\n", curl_config_quote(&value)))
+        .unwrap_or_default();
     let config = format!(
         concat!(
-            "url = \"https://api.anthropic.com/api/oauth/usage\"\n",
+            "url = \"https://api.anthropic.com{}\"\n",
+            "{}",
+            "connect-timeout = 3\n",
             "header = \"Authorization: Bearer {}\"\n",
             "header = \"Accept: application/json\"\n",
             "header = \"Content-Type: application/json\"\n",
             "header = \"anthropic-beta: oauth-2025-04-20\"\n",
             "header = \"User-Agent: claude-code/2.1.0\"\n"
         ),
+        curl_config_quote(path),
+        proxy,
         curl_config_quote(access_token)
     );
     let mut child = Command::new("curl")
         .arg("-sS")
         .arg("--max-time")
-        .arg("5")
+        .arg(max_time_secs.to_string())
         .arg("--config")
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("调用 Claude OAuth usage 失败: {e}"))?;
+        .map_err(|e| format!("调用 Claude OAuth API 失败: {e}"))?;
     {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| "无法写入 Claude OAuth usage 请求配置".to_string())?;
+            .ok_or_else(|| "无法写入 Claude OAuth API 请求配置".to_string())?;
         stdin
             .write_all(config.as_bytes())
-            .map_err(|e| format!("写入 Claude OAuth usage 请求配置失败: {e}"))?;
+            .map_err(|e| format!("写入 Claude OAuth API 请求配置失败: {e}"))?;
     }
     let output = child
         .wait_with_output()
-        .map_err(|e| format!("等待 Claude OAuth usage 失败: {e}"))?;
+        .map_err(|e| format!("等待 Claude OAuth API 失败: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "Claude OAuth usage HTTP 失败: {}",
+            "Claude OAuth API HTTP 失败: {}",
             String::from_utf8_lossy(&output.stderr)
         ));
     }
     let body = String::from_utf8_lossy(&output.stdout);
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Claude OAuth usage JSON 解析失败: {e}"))?;
+    serde_json::from_str(&body).map_err(|e| format!("Claude OAuth API JSON 解析失败: {e}"))
+}
+
+fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
+    let Some(raw) = read_keychain_password()? else {
+        return Err("Keychain 中没有 Claude OAuth 凭据".to_string());
+    };
+    let access_token = oauth_access_token_from_raw(&raw)?;
+    let value = claude_oauth_api("/api/oauth/usage", &access_token, 8)?;
 
     let session_ok = apply_oauth_window(&mut snapshot.session, value.get("five_hour"));
     let weekly_ok = apply_oauth_window(&mut snapshot.weekly, value.get("seven_day"));
@@ -825,11 +850,10 @@ fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
         .latest_message_at
         .map(|value| value.format("%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "无记录".to_string());
-    let title = format!("Claude 5h {session}");
     let tooltip = format!(
         "Claude Switcher\n近 5 小时: {session} token\n近 7 天: {weekly} token\n常用模型: {model}\n最近记录: {latest}"
     );
-    tray.set_title(Some(title))
+    tray.set_title(None::<String>)
         .map_err(|e| format!("更新菜单栏标题失败: {e}"))?;
     tray.set_tooltip(Some(tooltip))
         .map_err(|e| format!("更新菜单栏提示失败: {e}"))?;
@@ -903,7 +927,7 @@ fn show_main_window(app: &AppHandle) {
 fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
     if let Some(tray) = app_handle.tray_by_id("main") {
-        let _ = tray.set_title(Some("Claude".to_string()));
+        let _ = tray.set_title(None::<String>);
         let _ = tray.set_tooltip(Some("Claude Switcher".to_string()));
     }
 
@@ -990,6 +1014,51 @@ fn fill_meta_from_saved_profile(meta: &mut ProfileMeta, store: &Store) {
     if meta.rate_limit_tier.is_none() {
         meta.rate_limit_tier = profile.meta.rate_limit_tier.clone();
     }
+}
+
+fn apply_oauth_profile(
+    meta: &mut ProfileMeta,
+    keychain_password: Option<&str>,
+) -> Result<(), String> {
+    let Some(raw) = keychain_password else {
+        return Ok(());
+    };
+    let access_token = oauth_access_token_from_raw(raw)?;
+    let value = claude_oauth_api("/api/oauth/profile", &access_token, 8)?;
+    if let Some(account) = value.get("account") {
+        meta.email = string_field(account, &["email"])
+            .map(ToOwned::to_owned)
+            .or(meta.email.take());
+        meta.account_uuid = string_field(account, &["uuid"])
+            .map(ToOwned::to_owned)
+            .or(meta.account_uuid.take());
+        if account
+            .get("has_claude_max")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false)
+        {
+            meta.subscription_type = Some("max".to_string());
+        } else if account
+            .get("has_claude_pro")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false)
+        {
+            meta.subscription_type = Some("pro".to_string());
+        }
+    }
+    if let Some(organization) = value.get("organization") {
+        meta.organization_uuid = string_field(organization, &["uuid"])
+            .map(ToOwned::to_owned)
+            .or(meta.organization_uuid.take());
+        meta.organization_name = string_field(organization, &["name"])
+            .map(ToOwned::to_owned)
+            .or(meta.organization_name.take());
+        meta.rate_limit_tier = string_field(organization, &["rate_limit_tier"])
+            .map(ToOwned::to_owned)
+            .or(meta.rate_limit_tier.take());
+    }
+    meta.has_oauth_account = true;
+    Ok(())
 }
 
 fn current_username() -> Result<String, String> {
@@ -1203,12 +1272,21 @@ fn detect_clash_runtime_config() -> ClashRuntimeConfig {
         let secret = string_field(&value, &["secret"])
             .filter(|s| !s.trim().is_empty())
             .map(ToOwned::to_owned);
-        return ClashRuntimeConfig { controller, secret };
+        let proxy = numeric_field(&value, &["mixed-port"])
+            .or_else(|| numeric_field(&value, &["port"]))
+            .filter(|port| *port > 0)
+            .map(|port| format!("http://127.0.0.1:{port}"));
+        return ClashRuntimeConfig {
+            controller,
+            secret,
+            proxy,
+        };
     }
 
     ClashRuntimeConfig {
         controller: "http://127.0.0.1:9090".to_string(),
         secret: None,
+        proxy: None,
     }
 }
 
@@ -2031,6 +2109,11 @@ fn get_status() -> Result<ClaudeStatus, String> {
     let mut meta = extract_meta(claude_json.as_ref(), keychain.as_deref());
     fill_meta_from_saved_profile(&mut meta, &store);
     let mut warnings = Vec::new();
+    if let Err(error) = apply_oauth_profile(&mut meta, keychain.as_deref()) {
+        warnings.push(format!(
+            "官方 Claude OAuth profile 读取失败，已回退本地账号信息: {error}"
+        ));
+    }
 
     if claude_json.is_none() {
         warnings.push("没有发现 ~/.claude.json，可能尚未登录 Claude Code".to_string());
