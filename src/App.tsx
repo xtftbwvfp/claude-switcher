@@ -140,6 +140,7 @@ interface UsageWindow {
   totals: TokenTotals;
   message_count: number;
   reset_at?: string | null;
+  used_percent?: number | null;
 }
 
 interface DailyUsage {

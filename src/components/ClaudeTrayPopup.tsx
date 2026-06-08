@@ -33,6 +33,7 @@ interface UsageWindow {
   totals: TokenTotals;
   message_count: number;
   reset_at?: string | null;
+  used_percent?: number | null;
 }
 
 interface ClaudeUsageSnapshot {
@@ -104,6 +105,9 @@ function capacities(status: ClaudeStatus | null) {
 }
 
 function remainingPercent(window: UsageWindow | undefined, capacity: number) {
+  if (typeof window?.used_percent === 'number') {
+    return Math.max(0, Math.min(100, Math.round(100 - window.used_percent)));
+  }
   if (!window || capacity <= 0) return 100;
   const used = Math.min(100, (window.totals.total_tokens / capacity) * 100);
   return Math.max(0, Math.round(100 - used));

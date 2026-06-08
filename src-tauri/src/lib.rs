@@ -247,6 +247,7 @@ struct UsageWindow {
     totals: TokenTotals,
     message_count: u64,
     reset_at: Option<DateTime<Utc>>,
+    used_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -479,7 +480,76 @@ fn usage_window(
         totals,
         message_count,
         reset_at,
+        used_percent: None,
     }
+}
+
+fn parse_oauth_reset(value: Option<&str>) -> Option<DateTime<Utc>> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(raw)
+        .map(|value| value.with_timezone(&Utc))
+        .ok()
+}
+
+fn apply_oauth_window(window: &mut UsageWindow, value: Option<&Value>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(utilization) = value.get("utilization").and_then(|v| v.as_f64()) else {
+        return false;
+    };
+    window.used_percent = Some(utilization.clamp(0.0, 100.0));
+    window.reset_at = parse_oauth_reset(value.get("resets_at").and_then(|v| v.as_str()));
+    true
+}
+
+fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
+    let Some(raw) = read_keychain_password()? else {
+        return Err("Keychain 中没有 Claude OAuth 凭据".to_string());
+    };
+    let parsed: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("Keychain OAuth JSON 解析失败: {e}"))?;
+    let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
+    let access_token = string_field(oauth, &["accessToken"])
+        .or_else(|| string_field(oauth, &["access_token"]))
+        .ok_or_else(|| "Keychain OAuth 中没有 accessToken".to_string())?;
+
+    let output = Command::new("curl")
+        .arg("-sS")
+        .arg("--max-time")
+        .arg("30")
+        .arg("https://api.anthropic.com/api/oauth/usage")
+        .arg("-H")
+        .arg(format!("Authorization: Bearer {access_token}"))
+        .arg("-H")
+        .arg("Accept: application/json")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-H")
+        .arg("anthropic-beta: oauth-2025-04-20")
+        .arg("-H")
+        .arg("User-Agent: claude-code/2.1.0")
+        .output()
+        .map_err(|e| format!("调用 Claude OAuth usage 失败: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Claude OAuth usage HTTP 失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let body = String::from_utf8_lossy(&output.stdout);
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Claude OAuth usage JSON 解析失败: {e}"))?;
+
+    let session_ok = apply_oauth_window(&mut snapshot.session, value.get("five_hour"));
+    let weekly_ok = apply_oauth_window(&mut snapshot.weekly, value.get("seven_day"));
+    if !session_ok && !weekly_ok {
+        return Err("Claude OAuth usage 响应缺少 five_hour/seven_day utilization".to_string());
+    }
+    Ok(())
 }
 
 fn add_daily_usage(
@@ -650,7 +720,7 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
         .max_by_key(|(_, count)| *count)
         .map(|(model, _)| model);
 
-    Ok(ClaudeUsageSnapshot {
+    let mut snapshot = ClaudeUsageSnapshot {
         updated_at: now,
         scanned_files: files.len(),
         scanned_messages,
@@ -682,7 +752,13 @@ fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
         daily: daily_rows,
         top_model,
         warnings,
-    })
+    };
+    if let Err(error) = apply_oauth_usage(&mut snapshot) {
+        snapshot.warnings.push(format!(
+            "官方 Claude OAuth usage 读取失败，已回退本地日志估算: {error}"
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn compact_token_count(value: u64) -> String {
