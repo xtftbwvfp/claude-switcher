@@ -150,6 +150,129 @@ h2 {
   font-weight: 800;
 }
 
+.modal-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(32, 32, 29, 0.46);
+  backdrop-filter: blur(8px);
+}
+
+.prepare-modal {
+  width: min(520px, calc(100vw - 40px));
+  border: 1px solid rgba(32, 32, 29, 0.16);
+  border-radius: 8px;
+  padding: 22px;
+  color: #20201d;
+  background: #faf7ed;
+  box-shadow: 0 28px 90px rgba(32, 32, 29, 0.28);
+}
+
+.modal-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.modal-title svg {
+  flex: 0 0 auto;
+  color: #2f5d50;
+}
+
+.modal-title strong {
+  display: block;
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.modal-title span {
+  display: block;
+  margin-top: 6px;
+  color: #756c5b;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.prepare-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin: 18px 0;
+}
+
+.prepare-summary div {
+  min-width: 0;
+  padding: 12px;
+  border-radius: 6px;
+  background: #eee5d6;
+}
+
+.prepare-summary span,
+.work-note {
+  color: #756c5b;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.prepare-summary strong {
+  display: block;
+  overflow: hidden;
+  margin-top: 5px;
+  color: #20201d;
+  font-size: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-note {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.work-note textarea {
+  width: 100%;
+  resize: vertical;
+}
+
+.prepare-progress {
+  margin-top: 18px;
+}
+
+.progress-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+  color: #5c574d;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.progress-track {
+  height: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #d8d0bf;
+}
+
+.progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #d98361, #2f5d50);
+  transition: width 0.24s ease;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+}
+
 .grid {
   display: grid;
   grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.85fr);

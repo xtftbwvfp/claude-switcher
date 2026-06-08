@@ -242,6 +242,8 @@ type BusyAction =
   | 'telemetry'
   | null;
 
+type NewAccountModalState = 'draft' | 'running' | 'done';
+
 // 遥测去关联：三态。后端按这些字符串向 settings.env 注入 / 清理隐私 env。
 type TelemetryMode = 'default' | 'disableTelemetry' | 'essentialOnly';
 
@@ -424,6 +426,11 @@ function App() {
   const [actionWarnings, setActionWarnings] = useState<string[]>([]);
   const [backups, setBackups] = useState<BackupSummary[]>([]);
   const [telemetryMode, setTelemetryMode] = useState<TelemetryMode | null>(null);
+  const [newAccountModalOpen, setNewAccountModalOpen] = useState(false);
+  const [newAccountModalState, setNewAccountModalState] = useState<NewAccountModalState>('draft');
+  const [newAccountProgress, setNewAccountProgress] = useState(0);
+  const [currentWorkNote, setCurrentWorkNote] = useState('');
+  const [newAccountStep, setNewAccountStep] = useState('等待确认');
 
   const currentProfile = useMemo(
     () => profiles.find((profile) => profile.is_current) || null,
@@ -534,26 +541,62 @@ function App() {
       return '已保存当前 Claude Code 账号快照';
     });
 
-  const prepareNewAccount = () => {
-    if (
-      !window.confirm(
-        `准备新号登录「${newAccountName.trim()}」？\n\n工具会先结束所有 Claude Code CLI 进程，保存当前账号状态，把 Auto-Claude 切到「${newAccountNode}」，清空当前 Claude OAuth，并打开一个干净的 Claude 登录窗口。`,
-      )
-    )
-      return;
-    run('new-login', async () => {
-      setActionWarnings([]);
+  const openPrepareNewAccountModal = () => {
+    setCurrentWorkNote('');
+    setNewAccountProgress(0);
+    setNewAccountStep('等待确认');
+    setNewAccountModalState('draft');
+    setNewAccountModalOpen(true);
+  };
+
+  const closePrepareNewAccountModal = () => {
+    if (newAccountModalState === 'running') return;
+    setNewAccountModalOpen(false);
+  };
+
+  const prepareNewAccount = async () => {
+    setBusy('new-login');
+    setError(null);
+    setActionWarnings([]);
+    setNewAccountModalState('running');
+    setNewAccountProgress(8);
+    setNewAccountStep('记录当前工作');
+    try {
+      await nextAnimationFrame();
+      const noteParts = [
+        newAccountNotes.trim(),
+        currentWorkNote.trim() ? `切号前正在处理: ${currentWorkNote.trim()}` : '',
+      ].filter(Boolean);
+      setNewAccountProgress(22);
+      setNewAccountStep('保存当前账号状态');
+      await nextAnimationFrame();
+      setNewAccountProgress(38);
+      setNewAccountStep(`切换 Auto-Claude 到 ${newAccountNode}`);
       const result = await invoke<PrepareNewAccountResult>('prepare_new_account_login', {
         name: newAccountName.trim(),
-        notes: newAccountNotes.trim() || null,
+        notes: noteParts.join('\n\n') || null,
         node: newAccountNode,
         timezone: newAccountTimezone.trim() || null,
         locale: newAccountLocale.trim() || null,
         chromeProfile: newAccountChromeProfile.trim() || null,
       });
+      setNewAccountProgress(88);
+      setNewAccountStep('打开 Claude 登录窗口');
+      setActionWarnings([]);
       setActionWarnings(result.warnings ?? []);
-      return `已准备新号「${result.pending.name}」登录；Auto-Claude 已切到 ${result.clash.node}`;
-    });
+      setToast(`已准备新号「${result.pending.name}」登录；Auto-Claude 已切到 ${result.clash.node}`);
+      await load();
+      setNewAccountProgress(100);
+      setNewAccountStep('完成，可以去浏览器登录');
+      setNewAccountModalState('done');
+    } catch (err) {
+      setError(String(err));
+      setNewAccountStep('准备失败，请看错误提示');
+      setNewAccountModalState('draft');
+      setNewAccountProgress(0);
+    } finally {
+      setBusy(null);
+    }
   };
 
   const finishNewAccount = () =>
@@ -716,6 +759,74 @@ function App() {
             ))}
           </div>
           <button onClick={() => setActionWarnings([])}>关闭</button>
+        </div>
+      )}
+
+      {newAccountModalOpen && (
+        <div className="modal-scrim" role="presentation">
+          <section className="prepare-modal" role="dialog" aria-modal="true" aria-labelledby="prepare-title">
+            <div className="modal-title" id="prepare-title">
+              <ShieldAlert />
+              <div>
+                <strong>准备尼区新号登录</strong>
+                <span>保存当前账号、切换 Auto-Claude、清理 OAuth，并打开登录窗口。</span>
+              </div>
+            </div>
+
+            <div className="prepare-summary">
+              <div>
+                <span>新号</span>
+                <strong>{newAccountName || '未命名'}</strong>
+              </div>
+              <div>
+                <span>节点</span>
+                <strong>{newAccountNode || '未选择'}</strong>
+              </div>
+              <div>
+                <span>环境</span>
+                <strong>
+                  {newAccountTimezone || '未设置'} · {newAccountChromeProfile || '未设置'}
+                </strong>
+              </div>
+            </div>
+
+            <label className="work-note">
+              当前正在干的事
+              <textarea
+                value={currentWorkNote}
+                onChange={(event) => setCurrentWorkNote(event.target.value)}
+                disabled={newAccountModalState !== 'draft'}
+                rows={4}
+                placeholder="例如：BuildYou 5050 hook 清理，下一步验证 hiddenSelectedImageDefaults 是否能原生化"
+              />
+            </label>
+
+            <div className="prepare-progress">
+              <div className="progress-label">
+                <span>{newAccountStep}</span>
+                <strong>{newAccountProgress}%</strong>
+              </div>
+              <div className="progress-track">
+                <div className="progress-fill" style={{ width: `${newAccountProgress}%` }} />
+              </div>
+            </div>
+
+            <div className="modal-actions">
+              <button className="ghost" onClick={closePrepareNewAccountModal} disabled={newAccountModalState === 'running'}>
+                {newAccountModalState === 'done' ? '关闭' : '取消'}
+              </button>
+              {newAccountModalState === 'done' ? (
+                <button className="primary" onClick={closePrepareNewAccountModal}>
+                  已打开登录，去授权
+                </button>
+              ) : (
+                <button className="primary" onClick={prepareNewAccount} disabled={newAccountModalState === 'running'}>
+                  {newAccountModalState === 'running' ? <Loader2 className="spin" /> : <ShieldAlert />}
+                  开始准备登录
+                </button>
+              )}
+            </div>
+          </section>
         </div>
       )}
 
@@ -896,7 +1007,7 @@ function App() {
                   />
                 </label>
               </div>
-              <button className="primary wide" onClick={prepareNewAccount} disabled={!canPrepareNewAccount}>
+              <button className="primary wide" onClick={openPrepareNewAccountModal} disabled={!canPrepareNewAccount}>
                 {busy === 'new-login' ? <Loader2 className="spin" /> : <ShieldAlert />}
                 准备并打开登录
               </button>
