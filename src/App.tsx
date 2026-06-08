@@ -81,6 +81,7 @@ interface ClaudeStatus {
   backup_dir: string;
   profile_count: number;
   current_profile_id?: string | null;
+  current_profile_name?: string | null;
   warnings: string[];
   telemetry_mode: TelemetryMode;
 }
@@ -219,6 +220,10 @@ function shortId(value?: string | null) {
   return value.length > 14 ? `${value.slice(0, 8)}…${value.slice(-4)}` : value;
 }
 
+function statusAccountLabel(status?: ClaudeStatus | null) {
+  return status?.meta.email ? shortId(status.meta.email) : status?.current_profile_name || '未发现';
+}
+
 function dateLabel(value?: string | null) {
   if (!value) return '从未';
   return fmt.format(new Date(value));
@@ -332,7 +337,7 @@ function App() {
   const [notes, setNotes] = useState('');
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<BusyAction>('refresh');
+  const [busy, setBusy] = useState<BusyAction | null>(null);
   const [clashStatus, setClashStatus] = useState<ClashStatus | null>(null);
   const [actionWarnings, setActionWarnings] = useState<string[]>([]);
   const [backups, setBackups] = useState<BackupSummary[]>([]);
@@ -352,34 +357,38 @@ function App() {
         invoke<ProfileSummary[]>('list_profiles'),
         invoke<BackupSummary[]>('list_backups'),
       ]);
-      const nextUsage = await invoke<ClaudeUsageSnapshot>('get_claude_usage').catch((err) => ({
-        updated_at: new Date().toISOString(),
-        scanned_files: 0,
-        scanned_messages: 0,
-        latest_message_at: null,
-        session: { label: '近 5 小时', totals: emptyTotals(), message_count: 0, reset_at: null },
-        weekly: { label: '近 7 天', totals: emptyTotals(), message_count: 0, reset_at: null },
-        today: { label: '今天', totals: emptyTotals(), message_count: 0, reset_at: null },
-        last_30_days: { label: '近 30 天', totals: emptyTotals(), message_count: 0, reset_at: null },
-        daily: [],
-        top_model: null,
-        warnings: [String(err)],
-      }));
-      const nextClashStatus = await invoke<ClashStatus>('get_clash_status').catch((err) => ({
-        available: false,
-        controller: 'http://127.0.0.1:9090',
-        group: 'Auto-Claude',
-        nodes: [],
-        error: String(err),
-      }));
       setStatus(nextStatus);
       setProfiles(nextProfiles);
       setBackups(nextBackups);
-      setUsage(nextUsage);
-      setClashStatus(nextClashStatus);
 
       // 遥测模式：get_status 始终带 telemetry_mode（后端非 Option 字段）。
       setTelemetryMode(nextStatus.telemetry_mode);
+
+      Promise.all([
+        invoke<ClaudeUsageSnapshot>('get_claude_usage').catch((err) => ({
+          updated_at: new Date().toISOString(),
+          scanned_files: 0,
+          scanned_messages: 0,
+          latest_message_at: null,
+          session: { label: '近 5 小时', totals: emptyTotals(), message_count: 0, reset_at: null },
+          weekly: { label: '近 7 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+          today: { label: '今天', totals: emptyTotals(), message_count: 0, reset_at: null },
+          last_30_days: { label: '近 30 天', totals: emptyTotals(), message_count: 0, reset_at: null },
+          daily: [],
+          top_model: null,
+          warnings: [String(err)],
+        })),
+        invoke<ClashStatus>('get_clash_status').catch((err) => ({
+          available: false,
+          controller: 'http://127.0.0.1:9090',
+          group: 'Auto-Claude',
+          nodes: [],
+          error: String(err),
+        })),
+      ]).then(([nextUsage, nextClashStatus]) => {
+        setUsage(nextUsage);
+        setClashStatus(nextClashStatus);
+      });
     } catch (err) {
       setError(String(err));
     } finally {
@@ -559,7 +568,7 @@ function App() {
             <span>当前本机状态</span>
           </div>
           <div className="identity">
-            <strong>{shortId(status?.meta.email)}</strong>
+            <strong>{statusAccountLabel(status)}</strong>
             <span>{status?.meta.organization_name || '未读取到组织名'}</span>
           </div>
           <div className="pills">
@@ -589,7 +598,7 @@ function App() {
             <StatusIcon
               ok={!!status?.meta.has_oauth_account}
               label="账号"
-              detail={status?.meta.email ? shortId(status.meta.email) : '未读取'}
+              detail={statusAccountLabel(status)}
             />
             <StatusIcon
               ok={!!status?.keychain_exists && !!status?.keychain_parse_ok}

@@ -9,9 +9,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration as StdDuration;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -161,6 +161,7 @@ struct ClaudeStatus {
     backup_dir: String,
     profile_count: usize,
     current_profile_id: Option<String>,
+    current_profile_name: Option<String>,
     // 当前遥测去关联模式（"default"/"disableTelemetry"/"essentialOnly"）。
     telemetry_mode: TelemetryMode,
     warnings: Vec<String>,
@@ -506,6 +507,13 @@ fn apply_oauth_window(window: &mut UsageWindow, value: Option<&Value>) -> bool {
     true
 }
 
+fn curl_config_quote(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], "")
+}
+
 fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
     let Some(raw) = read_keychain_password()? else {
         return Err("Keychain 中没有 Claude OAuth 凭据".to_string());
@@ -517,23 +525,40 @@ fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
         .or_else(|| string_field(oauth, &["access_token"]))
         .ok_or_else(|| "Keychain OAuth 中没有 accessToken".to_string())?;
 
-    let output = Command::new("curl")
+    let config = format!(
+        concat!(
+            "url = \"https://api.anthropic.com/api/oauth/usage\"\n",
+            "header = \"Authorization: Bearer {}\"\n",
+            "header = \"Accept: application/json\"\n",
+            "header = \"Content-Type: application/json\"\n",
+            "header = \"anthropic-beta: oauth-2025-04-20\"\n",
+            "header = \"User-Agent: claude-code/2.1.0\"\n"
+        ),
+        curl_config_quote(access_token)
+    );
+    let mut child = Command::new("curl")
         .arg("-sS")
         .arg("--max-time")
-        .arg("30")
-        .arg("https://api.anthropic.com/api/oauth/usage")
-        .arg("-H")
-        .arg(format!("Authorization: Bearer {access_token}"))
-        .arg("-H")
-        .arg("Accept: application/json")
-        .arg("-H")
-        .arg("Content-Type: application/json")
-        .arg("-H")
-        .arg("anthropic-beta: oauth-2025-04-20")
-        .arg("-H")
-        .arg("User-Agent: claude-code/2.1.0")
-        .output()
+        .arg("5")
+        .arg("--config")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("调用 Claude OAuth usage 失败: {e}"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "无法写入 Claude OAuth usage 请求配置".to_string())?;
+        stdin
+            .write_all(config.as_bytes())
+            .map_err(|e| format!("写入 Claude OAuth usage 请求配置失败: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("等待 Claude OAuth usage 失败: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "Claude OAuth usage HTTP 失败: {}",
@@ -877,12 +902,18 @@ fn show_main_window(app: &AppHandle) {
 
 fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
-    let _ = refresh_tray_status(&app_handle);
+    if let Some(tray) = app_handle.tray_by_id("main") {
+        let _ = tray.set_title(Some("Claude".to_string()));
+        let _ = tray.set_tooltip(Some("Claude Switcher".to_string()));
+    }
 
     let refresh_handle = app_handle.clone();
-    thread::spawn(move || loop {
-        thread::sleep(StdDuration::from_secs(60));
+    thread::spawn(move || {
         let _ = refresh_tray_status(&refresh_handle);
+        loop {
+            thread::sleep(StdDuration::from_secs(60));
+            let _ = refresh_tray_status(&refresh_handle);
+        }
     });
 
     app.on_tray_icon_event(|app, event| {
@@ -919,6 +950,11 @@ fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) ->
         meta.has_keychain_credentials = true;
         if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
             let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
+            meta.has_oauth_account = true;
+            if meta.email.is_none() {
+                meta.email = string_field(oauth, &["email", "accountEmail", "username"])
+                    .map(ToOwned::to_owned);
+            }
             meta.has_trusted_device_token = oauth.get("trustedDeviceToken").is_some();
             meta.subscription_type =
                 string_field(oauth, &["subscriptionType"]).map(ToOwned::to_owned);
@@ -927,6 +963,33 @@ fn extract_meta(claude_json: Option<&Value>, keychain_password: Option<&str>) ->
     }
 
     meta
+}
+
+fn fill_meta_from_saved_profile(meta: &mut ProfileMeta, store: &Store) {
+    let Some(current_id) = store.current_profile_id.as_deref() else {
+        return;
+    };
+    let Some(profile) = store.profiles.iter().find(|item| item.id == current_id) else {
+        return;
+    };
+    if meta.email.is_none() {
+        meta.email = profile.meta.email.clone();
+    }
+    if meta.account_uuid.is_none() {
+        meta.account_uuid = profile.meta.account_uuid.clone();
+    }
+    if meta.organization_uuid.is_none() {
+        meta.organization_uuid = profile.meta.organization_uuid.clone();
+    }
+    if meta.organization_name.is_none() {
+        meta.organization_name = profile.meta.organization_name.clone();
+    }
+    if meta.subscription_type.is_none() {
+        meta.subscription_type = profile.meta.subscription_type.clone();
+    }
+    if meta.rate_limit_tier.is_none() {
+        meta.rate_limit_tier = profile.meta.rate_limit_tier.clone();
+    }
 }
 
 fn current_username() -> Result<String, String> {
@@ -1965,7 +2028,8 @@ fn get_status() -> Result<ClaudeStatus, String> {
         .as_ref()
         .map(|raw| serde_json::from_str::<Value>(raw).is_ok())
         .unwrap_or(false);
-    let meta = extract_meta(claude_json.as_ref(), keychain.as_deref());
+    let mut meta = extract_meta(claude_json.as_ref(), keychain.as_deref());
+    fill_meta_from_saved_profile(&mut meta, &store);
     let mut warnings = Vec::new();
 
     if claude_json.is_none() {
@@ -2010,6 +2074,11 @@ fn get_status() -> Result<ClaudeStatus, String> {
         data_dir: app_data_dir()?.to_string_lossy().to_string(),
         backup_dir: backups_dir()?.to_string_lossy().to_string(),
         profile_count: store.profiles.len(),
+        current_profile_name: store
+            .current_profile_id
+            .as_deref()
+            .and_then(|id| store.profiles.iter().find(|profile| profile.id == id))
+            .map(|profile| profile.name.clone()),
         current_profile_id: store.current_profile_id,
         telemetry_mode: store.telemetry_mode,
         warnings,

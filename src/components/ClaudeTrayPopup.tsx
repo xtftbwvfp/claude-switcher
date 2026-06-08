@@ -12,6 +12,7 @@ interface ProfileMeta {
 interface ClaudeStatus {
   keychain_exists: boolean;
   keychain_parse_ok: boolean;
+  current_profile_name?: string | null;
   meta: ProfileMeta;
 }
 
@@ -93,6 +94,11 @@ function shortEmail(value?: string | null) {
   const [name, domain] = value.split('@');
   if (!domain) return value;
   return `${name.slice(0, 3)}***@${domain}`;
+}
+
+function accountLabel(status: ClaudeStatus | null) {
+  if (status?.meta.email) return shortEmail(status.meta.email);
+  return status?.current_profile_name || '未读取账号';
 }
 
 function planLabel(status: ClaudeStatus | null) {
@@ -179,7 +185,7 @@ export function ClaudeTrayPopup() {
     document.documentElement.classList.add('is-claude-tray-popup');
     document.body.classList.add('is-claude-tray-popup');
     fetchData();
-    const interval = window.setInterval(fetchData, 5000);
+    const interval = window.setInterval(fetchData, 30000);
     return () => {
       window.clearInterval(interval);
       document.documentElement.classList.remove('is-claude-tray-popup');
@@ -216,7 +222,7 @@ export function ClaudeTrayPopup() {
       </div>
 
       <div className="ctp-account">
-        {shortEmail(data.status?.meta.email)}
+        {accountLabel(data.status)}
         <span className="ctp-plan">{planLabel(data.status)}</span>
         <span className={keychainOk ? 'ctp-auth ok' : 'ctp-auth'}>{keychainOk ? 'AUTH OK' : 'AUTH MISS'}</span>
       </div>
