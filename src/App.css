@@ -411,6 +411,16 @@ select:focus {
   line-height: 1.45;
 }
 
+.runtime-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.runtime-grid label {
+  margin-top: 18px;
+}
+
 .network-panel,
 .files-panel,
 .usage-panel {
@@ -748,6 +758,18 @@ code {
 
 .node-bind select {
   min-height: 42px;
+}
+
+.runtime-bind {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.runtime-bind input {
+  min-height: 38px;
+  padding: 9px 10px;
+  font-size: 12px;
 }
 
 .profile-actions {

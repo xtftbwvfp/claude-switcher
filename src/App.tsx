@@ -58,6 +58,7 @@ interface ProfileSummary {
   last_switched_at?: string | null;
   meta: ProfileMeta;
   clash?: ProfileClashBinding | null;
+  runtime?: ProfileRuntimeBinding | null;
   is_current: boolean;
 }
 
@@ -65,6 +66,12 @@ interface ProfileClashBinding {
   enabled: boolean;
   group: string;
   node: string;
+}
+
+interface ProfileRuntimeBinding {
+  timezone?: string | null;
+  locale?: string | null;
+  chrome_profile?: string | null;
 }
 
 interface ClaudeStatus {
@@ -100,6 +107,7 @@ interface PendingNewAccount {
   notes?: string | null;
   group: string;
   node: string;
+  runtime: ProfileRuntimeBinding;
   created_at: string;
 }
 
@@ -405,6 +413,9 @@ function App() {
   const [newAccountName, setNewAccountName] = useState('尼区');
   const [newAccountNotes, setNewAccountNotes] = useState('');
   const [newAccountNode, setNewAccountNode] = useState('');
+  const [newAccountTimezone, setNewAccountTimezone] = useState('Africa/Lagos');
+  const [newAccountLocale, setNewAccountLocale] = useState('en_US.UTF-8');
+  const [newAccountChromeProfile, setNewAccountChromeProfile] = useState('Profile 4');
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyAction | null>(null);
@@ -427,6 +438,19 @@ function App() {
       '';
     if (preferred) setNewAccountNode(preferred);
   }, [clashStatus?.nodes, newAccountNode]);
+
+  useEffect(() => {
+    const text = `${newAccountName} ${newAccountNode}`.toLowerCase();
+    if (text.includes('尼') || text.includes('nigeria') || text.includes('南非')) {
+      setNewAccountTimezone('Africa/Lagos');
+      setNewAccountLocale('en_US.UTF-8');
+      setNewAccountChromeProfile('Profile 4');
+    } else if (text.includes('美') || text.includes('us') || text.includes('38')) {
+      setNewAccountTimezone('America/Los_Angeles');
+      setNewAccountLocale('en_US.UTF-8');
+      setNewAccountChromeProfile('Profile 35');
+    }
+  }, [newAccountName, newAccountNode]);
 
   const refreshUsage = useCallback(async () => {
     setUsageRefreshing(true);
@@ -523,6 +547,9 @@ function App() {
         name: newAccountName.trim(),
         notes: newAccountNotes.trim() || null,
         node: newAccountNode,
+        timezone: newAccountTimezone.trim() || null,
+        locale: newAccountLocale.trim() || null,
+        chromeProfile: newAccountChromeProfile.trim() || null,
       });
       setActionWarnings(result.warnings ?? []);
       return `已准备新号「${result.pending.name}」登录；Auto-Claude 已切到 ${result.clash.node}`;
@@ -535,6 +562,9 @@ function App() {
       setNewAccountName('尼区');
       setNewAccountNotes('');
       setNewAccountNode('');
+      setNewAccountTimezone('Africa/Lagos');
+      setNewAccountLocale('en_US.UTF-8');
+      setNewAccountChromeProfile('Profile 4');
       return '新号已保存并绑定节点';
     });
 
@@ -598,6 +628,18 @@ function App() {
         node,
       });
       return node ? `已绑定 Auto-Claude -> ${node}` : '已清除这个账号的节点绑定';
+    });
+
+  const bindRuntime = (profile: ProfileSummary, patch: Partial<ProfileRuntimeBinding>) =>
+    run('bind', async () => {
+      const next = { ...(profile.runtime ?? {}), ...patch };
+      await invoke('set_profile_runtime_binding', {
+        id: profile.id,
+        timezone: next.timezone || null,
+        locale: next.locale || null,
+        chromeProfile: next.chrome_profile || null,
+      });
+      return '已保存账号环境绑定';
     });
 
   const testProfileNode = (id: string) =>
@@ -777,6 +819,17 @@ function App() {
                 <span>节点</span>
                 <strong>{status.pending_new_account.node}</strong>
               </div>
+              <div>
+                <span>环境</span>
+                <strong>
+                  {status.pending_new_account.runtime.timezone || '未设置'} ·{' '}
+                  {status.pending_new_account.runtime.locale || '未设置'}
+                </strong>
+              </div>
+              <div>
+                <span>Chrome</span>
+                <strong>{status.pending_new_account.runtime.chrome_profile || '未绑定'}</strong>
+              </div>
               <p>在刚打开的 Claude 窗口完成 OAuth 登录后，点下面保存成正式账号。</p>
               <button className="primary wide" onClick={finishNewAccount} disabled={!canFinishNewAccount}>
                 {busy === 'finish-new' ? <Loader2 className="spin" /> : <CheckCircle2 />}
@@ -817,6 +870,32 @@ function App() {
                   rows={3}
                 />
               </label>
+              <div className="runtime-grid">
+                <label>
+                  时区
+                  <input
+                    value={newAccountTimezone}
+                    onChange={(event) => setNewAccountTimezone(event.target.value)}
+                    placeholder="Africa/Lagos"
+                  />
+                </label>
+                <label>
+                  语言
+                  <input
+                    value={newAccountLocale}
+                    onChange={(event) => setNewAccountLocale(event.target.value)}
+                    placeholder="en_US.UTF-8"
+                  />
+                </label>
+                <label>
+                  Chrome Profile
+                  <input
+                    value={newAccountChromeProfile}
+                    onChange={(event) => setNewAccountChromeProfile(event.target.value)}
+                    placeholder="Profile 4"
+                  />
+                </label>
+              </div>
               <button className="primary wide" onClick={prepareNewAccount} disabled={!canPrepareNewAccount}>
                 {busy === 'new-login' ? <Loader2 className="spin" /> : <ShieldAlert />}
                 准备并打开登录
@@ -993,6 +1072,26 @@ function App() {
                   >
                     测节点
                   </button>
+                </div>
+                <div className="runtime-bind">
+                  <input
+                    defaultValue={profile.runtime?.timezone ?? ''}
+                    onBlur={(event) => bindRuntime(profile, { timezone: event.target.value })}
+                    disabled={!!busy}
+                    placeholder="TZ: America/Los_Angeles"
+                  />
+                  <input
+                    defaultValue={profile.runtime?.locale ?? ''}
+                    onBlur={(event) => bindRuntime(profile, { locale: event.target.value })}
+                    disabled={!!busy}
+                    placeholder="Locale: en_US.UTF-8"
+                  />
+                  <input
+                    defaultValue={profile.runtime?.chrome_profile ?? ''}
+                    onBlur={(event) => bindRuntime(profile, { chrome_profile: event.target.value })}
+                    disabled={!!busy}
+                    placeholder="Chrome: Profile 35"
+                  />
                 </div>
                 {profile.notes && <p>{profile.notes}</p>}
                 <div className="profile-actions">

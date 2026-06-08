@@ -47,6 +47,7 @@ const AUTH_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
     "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
 ];
+const PROFILE_ENV_KEYS: &[&str] = &["TZ", "LANG", "LC_ALL"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredProfile {
@@ -62,6 +63,8 @@ struct StoredProfile {
     meta: ProfileMeta,
     #[serde(default)]
     clash: Option<ProfileClashBinding>,
+    #[serde(default)]
+    runtime: Option<ProfileRuntimeBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +72,13 @@ struct ProfileClashBinding {
     enabled: bool,
     group: String,
     node: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProfileRuntimeBinding {
+    timezone: Option<String>,
+    locale: Option<String>,
+    chrome_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -114,6 +124,33 @@ fn default_telemetry_mode() -> TelemetryMode {
     TelemetryMode::DisableTelemetry
 }
 
+fn default_runtime_for_profile(name: &str, node: Option<&str>) -> ProfileRuntimeBinding {
+    let haystack = format!(
+        "{} {}",
+        name.to_lowercase(),
+        node.unwrap_or("").to_lowercase()
+    );
+    if haystack.contains("尼") || haystack.contains("nigeria") || haystack.contains("南非") {
+        ProfileRuntimeBinding {
+            timezone: Some("Africa/Lagos".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            chrome_profile: Some("Profile 4".to_string()),
+        }
+    } else if haystack.contains("美") || haystack.contains("us") || haystack.contains("38") {
+        ProfileRuntimeBinding {
+            timezone: Some("America/Los_Angeles".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            chrome_profile: Some("Profile 35".to_string()),
+        }
+    } else {
+        ProfileRuntimeBinding {
+            timezone: Some("America/Los_Angeles".to_string()),
+            locale: Some("en_US.UTF-8".to_string()),
+            chrome_profile: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Store {
     profiles: Vec<StoredProfile>,
@@ -145,6 +182,7 @@ struct PendingNewAccount {
     notes: Option<String>,
     group: String,
     node: String,
+    runtime: ProfileRuntimeBinding,
     created_at: DateTime<Utc>,
 }
 
@@ -158,6 +196,7 @@ struct ProfileSummary {
     last_switched_at: Option<DateTime<Utc>>,
     meta: ProfileMeta,
     clash: Option<ProfileClashBinding>,
+    runtime: Option<ProfileRuntimeBinding>,
     is_current: bool,
 }
 
@@ -448,6 +487,12 @@ fn load_store() -> Result<Store, String> {
             let plain = decrypt_secret(&enc)
                 .map_err(|e| format!("解密账号「{}」的 Keychain 凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(plain);
+        }
+        if profile.runtime.is_none() {
+            profile.runtime = Some(default_runtime_for_profile(
+                &profile.name,
+                profile.clash.as_ref().map(|binding| binding.node.as_str()),
+            ));
         }
     }
     Ok(store)
@@ -859,6 +904,16 @@ fn adopt_live_claude_local_state_for_profile(profile_id: &str) -> Result<Vec<Str
         profile_id,
         "file-history",
     )?);
+    warnings.extend(adopt_live_claude_dir_for_profile(
+        profile_id,
+        "shell-snapshots",
+    )?);
+    warnings.extend(adopt_live_claude_dir_for_profile(profile_id, "cache")?);
+    warnings.extend(adopt_live_claude_dir_for_profile(profile_id, "debug")?);
+    warnings.extend(adopt_live_claude_dir_for_profile(
+        profile_id,
+        "plugins/data",
+    )?);
     warnings.extend(adopt_live_claude_config_for_profile(profile_id)?);
     Ok(warnings)
 }
@@ -868,6 +923,10 @@ fn activate_profile_claude_local_state(profile_id: &str) -> Result<Vec<String>, 
     warnings.extend(activate_profile_sessions(profile_id)?);
     warnings.extend(activate_profile_claude_dir(profile_id, "telemetry")?);
     warnings.extend(activate_profile_claude_dir(profile_id, "file-history")?);
+    warnings.extend(activate_profile_claude_dir(profile_id, "shell-snapshots")?);
+    warnings.extend(activate_profile_claude_dir(profile_id, "cache")?);
+    warnings.extend(activate_profile_claude_dir(profile_id, "debug")?);
+    warnings.extend(activate_profile_claude_dir(profile_id, "plugins/data")?);
     warnings.extend(activate_profile_claude_config(profile_id)?);
     Ok(warnings)
 }
@@ -2674,7 +2733,10 @@ fn ensure_default_permissions(settings: &mut Value) {
     permissions.insert("defaultMode".to_string(), json!("bypassPermissions"));
 }
 
-fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
+fn apply_profile_env_to_settings(
+    mode: TelemetryMode,
+    runtime: Option<&ProfileRuntimeBinding>,
+) -> Result<(), String> {
     let path = claude_settings_path()?;
 
     // 读现有 settings；不存在则当空对象 {}。
@@ -2704,8 +2766,29 @@ fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
             .expect("settings.env 已确保为 object");
         env_obj.remove(ENV_DISABLE_TELEMETRY);
         env_obj.remove(ENV_DISABLE_NONESSENTIAL_TRAFFIC);
+        for key in PROFILE_ENV_KEYS {
+            env_obj.remove(*key);
+        }
         if let Some(key) = mode.env_key() {
             env_obj.insert(key.to_string(), json!("1"));
+        }
+        if let Some(runtime) = runtime {
+            if let Some(timezone) = runtime
+                .timezone
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                env_obj.insert("TZ".to_string(), json!(timezone.trim()));
+            }
+            if let Some(locale) = runtime
+                .locale
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                let locale = locale.trim();
+                env_obj.insert("LANG".to_string(), json!(locale));
+                env_obj.insert("LC_ALL".to_string(), json!(locale));
+            }
         }
         // Default 模式：两个都不加（净删除）。
     }
@@ -2787,7 +2870,7 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn open_clean_claude_login_terminal() -> Result<(), String> {
+fn open_clean_claude_login_terminal(runtime: Option<&ProfileRuntimeBinding>) -> Result<(), String> {
     let mut parts = vec![
         "cd ~".to_string(),
         "env".to_string(),
@@ -2801,6 +2884,24 @@ fn open_clean_claude_login_terminal() -> Result<(), String> {
         parts.push(format!("HTTPS_PROXY={}", shell_single_quote(&proxy)));
         parts.push(format!("HTTP_PROXY={}", shell_single_quote(&proxy)));
         parts.push(format!("ALL_PROXY={}", shell_single_quote(&proxy)));
+    }
+    if let Some(runtime) = runtime {
+        if let Some(timezone) = runtime
+            .timezone
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            parts.push(format!("TZ={}", shell_single_quote(timezone.trim())));
+        }
+        if let Some(locale) = runtime
+            .locale
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            let locale = shell_single_quote(locale.trim());
+            parts.push(format!("LANG={locale}"));
+            parts.push(format!("LC_ALL={locale}"));
+        }
     }
     parts.push("claude".to_string());
     let terminal_command = parts.join(" ");
@@ -2818,6 +2919,27 @@ fn open_clean_claude_login_terminal() -> Result<(), String> {
     } else {
         Err(format!(
             "打开 Terminal 登录窗口失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
+fn open_chrome_profile(profile: &str, url: &str) -> Result<(), String> {
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Ok(());
+    }
+    let output = Command::new("open")
+        .args(["-na", "Google Chrome", "--args"])
+        .arg(format!("--profile-directory={profile}"))
+        .arg(url)
+        .output()
+        .map_err(|e| format!("打开 Chrome Profile 失败: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开 Chrome Profile 失败: {}",
             String::from_utf8_lossy(&output.stderr)
         ))
     }
@@ -2928,8 +3050,21 @@ fn set_telemetry_mode(mode: String) -> Result<(), String> {
     // 先持久化进 store，再立即落地到 settings.json（顺序：先存意图，后写文件）。
     let mut store = load_store()?;
     store.telemetry_mode = parsed;
+    let runtime = store
+        .pending_new_account
+        .as_ref()
+        .map(|pending| pending.runtime.clone())
+        .or_else(|| {
+            store.current_profile_id.as_deref().and_then(|id| {
+                store
+                    .profiles
+                    .iter()
+                    .find(|profile| profile.id == id)
+                    .and_then(|profile| profile.runtime.clone())
+            })
+        });
     save_store(&store)?;
-    apply_privacy_env_to_settings(parsed)
+    apply_profile_env_to_settings(parsed, runtime.as_ref())
 }
 
 #[tauri::command]
@@ -2947,6 +3082,7 @@ fn list_profiles() -> Result<Vec<ProfileSummary>, String> {
             last_switched_at: p.last_switched_at,
             meta: p.meta.clone(),
             clash: p.clash.clone(),
+            runtime: p.runtime.clone(),
             is_current: store.current_profile_id.as_deref() == Some(&p.id),
         })
         .collect())
@@ -2967,6 +3103,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
 
     let mut store = load_store()?;
     let now = Utc::now();
+    let runtime = default_runtime_for_profile(clean_name, None);
     let profile = StoredProfile {
         id: Uuid::new_v4().to_string(),
         name: clean_name.to_string(),
@@ -2979,6 +3116,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         settings_json,
         keychain_password,
         clash: None,
+        runtime: Some(runtime),
     };
     let summary = ProfileSummary {
         id: profile.id.clone(),
@@ -2989,6 +3127,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         last_switched_at: profile.last_switched_at,
         meta: profile.meta.clone(),
         clash: profile.clash.clone(),
+        runtime: profile.runtime.clone(),
         // 下面会把 current_profile_id 指向这个新建 profile，所以它就是当前账号。
         is_current: true,
     };
@@ -3006,6 +3145,9 @@ fn prepare_new_account_login(
     name: String,
     notes: Option<String>,
     node: String,
+    timezone: Option<String>,
+    locale: Option<String>,
+    chrome_profile: Option<String>,
 ) -> Result<PrepareNewAccountResult, String> {
     let clean_name = name.trim();
     if clean_name.is_empty() {
@@ -3035,6 +3177,28 @@ fn prepare_new_account_login(
     let (_, settings_json, _) = current_snapshot()?;
     let rollback_from = load_backup_snapshot(&PathBuf::from(&backup.path))?;
     let clash = switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
+    let mut runtime = default_runtime_for_profile(clean_name, Some(clean_node));
+    if timezone
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        runtime.timezone = timezone.map(|value| value.trim().to_string());
+    }
+    if locale
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        runtime.locale = locale.map(|value| value.trim().to_string());
+    }
+    if chrome_profile
+        .as_deref()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+    {
+        runtime.chrome_profile = chrome_profile.map(|value| value.trim().to_string());
+    }
 
     let pending = PendingNewAccount {
         id: format!("pending-{}", Uuid::new_v4()),
@@ -3042,10 +3206,11 @@ fn prepare_new_account_login(
         notes,
         group: DEFAULT_CLASH_GROUP.to_string(),
         node: clean_node.to_string(),
+        runtime,
         created_at: Utc::now(),
     };
     clean_live_account_for_new_login(settings_json, &rollback_from)?;
-    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+    if let Err(e) = apply_profile_env_to_settings(store.telemetry_mode, Some(&pending.runtime)) {
         warnings.push(format!(
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
@@ -3053,7 +3218,12 @@ fn prepare_new_account_login(
     warnings.extend(activate_profile_claude_local_state(&pending.id)?);
     store.pending_new_account = Some(pending.clone());
     save_store(&store)?;
-    if let Err(e) = open_clean_claude_login_terminal() {
+    if let Some(profile) = pending.runtime.chrome_profile.as_deref() {
+        if let Err(e) = open_chrome_profile(profile, "https://claude.ai") {
+            warnings.push(e);
+        }
+    }
+    if let Err(e) = open_clean_claude_login_terminal(Some(&pending.runtime)) {
         warnings.push(e);
     }
     Ok(PrepareNewAccountResult {
@@ -3102,6 +3272,7 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
             group: pending.group.clone(),
             node: pending.node.clone(),
         }),
+        runtime: Some(pending.runtime.clone()),
     };
     let summary = ProfileSummary {
         id: profile.id.clone(),
@@ -3112,6 +3283,7 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
         last_switched_at: profile.last_switched_at,
         meta: profile.meta.clone(),
         clash: profile.clash.clone(),
+        runtime: profile.runtime.clone(),
         is_current: true,
     };
     activate_profile_claude_local_state(&profile.id)?;
@@ -3201,7 +3373,7 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
     // 立即按 store 当前 telemetry_mode 把隐私 env 合并回去，避免切号把去关联冲掉。
     // 已过事务回滚保护区、账号材料已成功落盘——隐私 env 注入失败属非关键，best-effort：
     // 只记 warning，不让整个切号返回 Err（否则会出现「其实已切但 UI 报失败」的半成品态）。
-    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+    if let Err(e) = apply_profile_env_to_settings(store.telemetry_mode, profile.runtime.as_ref()) {
         warnings.push(format!(
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
@@ -3289,6 +3461,41 @@ fn set_profile_clash_binding(
     }
     profile.updated_at = Utc::now();
     save_store(&store)
+}
+
+#[tauri::command]
+fn set_profile_runtime_binding(
+    id: String,
+    timezone: Option<String>,
+    locale: Option<String>,
+    chrome_profile: Option<String>,
+) -> Result<(), String> {
+    let mut store = load_store()?;
+    let current = store.current_profile_id.as_deref() == Some(id.as_str());
+    let telemetry_mode = store.telemetry_mode;
+    let runtime = ProfileRuntimeBinding {
+        timezone: timezone
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        locale: locale
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        chrome_profile: chrome_profile
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    let profile = store
+        .profiles
+        .iter_mut()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "找不到这个账号快照".to_string())?;
+    profile.runtime = Some(runtime.clone());
+    profile.updated_at = Utc::now();
+    save_store(&store)?;
+    if current {
+        apply_profile_env_to_settings(telemetry_mode, Some(&runtime))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -3488,7 +3695,14 @@ fn restore_backup(id: String) -> Result<RestoreResult, String> {
     // 调用时机在 apply_account_material 之后、已过事务回滚保护区；恢复已成功落盘，
     // 隐私 env 注入失败属非关键，best-effort：只记 warning，不让恢复返回 Err。
     let store = load_store()?;
-    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+    let runtime = store.current_profile_id.as_deref().and_then(|id| {
+        store
+            .profiles
+            .iter()
+            .find(|profile| profile.id == id)
+            .and_then(|profile| profile.runtime.clone())
+    });
+    if let Err(e) = apply_profile_env_to_settings(store.telemetry_mode, runtime.as_ref()) {
         warnings.push(format!(
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
@@ -3568,6 +3782,7 @@ pub fn run() {
             switch_clash_node,
             switch_profile_clash_node,
             set_profile_clash_binding,
+            set_profile_runtime_binding,
             delete_profile,
             rename_profile,
             create_backup,
