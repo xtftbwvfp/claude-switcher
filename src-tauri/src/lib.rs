@@ -12,6 +12,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration as StdDuration;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
@@ -279,6 +280,14 @@ struct UsageRecord {
     model: String,
     usage: Value,
 }
+
+#[derive(Debug, Clone)]
+struct CachedOauthUsage {
+    fetched_at: DateTime<Utc>,
+    value: Value,
+}
+
+static OAUTH_USAGE_CACHE: OnceLock<Mutex<Option<CachedOauthUsage>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ClashRuntimeConfig {
@@ -592,12 +601,36 @@ fn claude_oauth_api(path: &str, access_token: &str, max_time_secs: u64) -> Resul
     serde_json::from_str(&body).map_err(|e| format!("Claude OAuth API JSON 解析失败: {e}"))
 }
 
+fn cached_oauth_usage(access_token: &str) -> Result<Value, String> {
+    let cache = OAUTH_USAGE_CACHE.get_or_init(|| Mutex::new(None));
+    match claude_oauth_api("/api/oauth/usage", access_token, 8) {
+        Ok(value) => {
+            if let Ok(mut guard) = cache.lock() {
+                *guard = Some(CachedOauthUsage {
+                    fetched_at: Utc::now(),
+                    value: value.clone(),
+                });
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            let cached = cache
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone())
+                .filter(|cached| Utc::now() - cached.fetched_at < Duration::minutes(10))
+                .map(|cached| cached.value);
+            cached.ok_or(error)
+        }
+    }
+}
+
 fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
     let Some(raw) = read_keychain_password()? else {
         return Err("Keychain 中没有 Claude OAuth 凭据".to_string());
     };
     let access_token = oauth_access_token_from_raw(&raw)?;
-    let value = claude_oauth_api("/api/oauth/usage", &access_token, 8)?;
+    let value = cached_oauth_usage(&access_token)?;
 
     let session_ok = apply_oauth_window(&mut snapshot.session, value.get("five_hour"));
     let weekly_ok = apply_oauth_window(&mut snapshot.weekly, value.get("seven_day"));

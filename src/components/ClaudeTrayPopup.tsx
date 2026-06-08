@@ -74,9 +74,9 @@ function compactNumber(value?: number | null) {
   return `${next}`;
 }
 
-function directTokens(totals?: TokenTotals | null) {
+function displayedTokens(totals?: TokenTotals | null) {
   if (!totals) return 0;
-  return (totals.input_tokens ?? 0) + (totals.output_tokens ?? 0);
+  return totals.total_tokens ?? 0;
 }
 
 function formatCountdown(value?: string | null) {
@@ -196,8 +196,8 @@ export function ClaudeTrayPopup() {
   const cap = useMemo(() => capacities(data.status), [data.status]);
   const sessionLeft = remainingPercent(data.usage?.session, cap.session);
   const weeklyLeft = remainingPercent(data.usage?.weekly, cap.weekly);
-  const sessionDirectTokens = directTokens(data.usage?.session.totals);
-  const todayDirectTokens = directTokens(data.usage?.today.totals);
+  const sessionTokens = displayedTokens(data.usage?.session.totals);
+  const todayTokens = displayedTokens(data.usage?.today.totals);
   const proxyOn = !!data.clash?.available;
   const keychainOk = !!data.status?.keychain_exists && !!data.status?.keychain_parse_ok;
 
@@ -249,7 +249,7 @@ export function ClaudeTrayPopup() {
             <span>TODAY</span>
           </div>
           <div className="ctp-card-value today-value">
-            {compactNumber(todayDirectTokens)}
+            {compactNumber(todayTokens)}
             <span className="ctp-remaining">Tokens</span>
           </div>
           <div className="ctp-token-detail">
@@ -263,7 +263,7 @@ export function ClaudeTrayPopup() {
             <span>TOKEN USAGE</span>
           </div>
           <div className="ctp-card-value token-value">
-            {compactNumber(sessionDirectTokens)}
+            {compactNumber(sessionTokens)}
             <span className="ctp-remaining">Tokens</span>
           </div>
           <div className="ctp-token-detail">
