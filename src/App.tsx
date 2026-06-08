@@ -83,6 +83,7 @@ interface ClaudeStatus {
   profile_count: number;
   current_profile_id?: string | null;
   current_profile_name?: string | null;
+  pending_new_account?: PendingNewAccount | null;
   warnings: string[];
   telemetry_mode: TelemetryMode;
 }
@@ -92,6 +93,15 @@ interface SessionIsolationStatus {
   live_path: string;
   target_path?: string | null;
   current_profile_path?: string | null;
+}
+
+interface PendingNewAccount {
+  id: string;
+  name: string;
+  notes?: string | null;
+  group: string;
+  node: string;
+  created_at: string;
 }
 
 interface BackupResult {
@@ -105,6 +115,13 @@ interface SwitchResult {
   backup: BackupResult;
   clash?: ClashSwitchResult | null;
   restart_hint: string;
+  warnings: string[];
+}
+
+interface PrepareNewAccountResult {
+  pending: PendingNewAccount;
+  backup: BackupResult;
+  clash: ClashSwitchResult;
   warnings: string[];
 }
 
@@ -175,6 +192,8 @@ interface ClaudeUsageSnapshot {
 type BusyAction =
   | 'refresh'
   | 'capture'
+  | 'new-login'
+  | 'finish-new'
   | 'switch'
   | 'backup'
   | 'delete'
@@ -353,6 +372,9 @@ function App() {
   const [usage, setUsage] = useState<ClaudeUsageSnapshot | null>(null);
   const [name, setName] = useState('');
   const [notes, setNotes] = useState('');
+  const [newAccountName, setNewAccountName] = useState('尼区');
+  const [newAccountNotes, setNewAccountNotes] = useState('');
+  const [newAccountNode, setNewAccountNode] = useState('');
   const [toast, setToast] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<BusyAction | null>(null);
@@ -365,6 +387,15 @@ function App() {
     () => profiles.find((profile) => profile.is_current) || null,
     [profiles],
   );
+
+  useEffect(() => {
+    if (newAccountNode || !clashStatus?.nodes.length) return;
+    const preferred =
+      clashStatus.nodes.find((node) => node === '南非-B') ||
+      clashStatus.nodes.find((node) => node.includes('南非')) ||
+      '';
+    if (preferred) setNewAccountNode(preferred);
+  }, [clashStatus?.nodes, newAccountNode]);
 
   const load = useCallback(async () => {
     setBusy('refresh');
@@ -441,6 +472,34 @@ function App() {
       setName('');
       setNotes('');
       return '已保存当前 Claude Code 账号快照';
+    });
+
+  const prepareNewAccount = () => {
+    if (
+      !window.confirm(
+        `准备新号登录「${newAccountName.trim()}」？\n\n工具会先保存当前账号状态，把 Auto-Claude 切到「${newAccountNode}」，清空当前 Claude OAuth，并打开一个干净的 Claude 登录窗口。`,
+      )
+    )
+      return;
+    run('new-login', async () => {
+      setActionWarnings([]);
+      const result = await invoke<PrepareNewAccountResult>('prepare_new_account_login', {
+        name: newAccountName.trim(),
+        notes: newAccountNotes.trim() || null,
+        node: newAccountNode,
+      });
+      setActionWarnings(result.warnings ?? []);
+      return `已准备新号「${result.pending.name}」登录；Auto-Claude 已切到 ${result.clash.node}`;
+    });
+  };
+
+  const finishNewAccount = () =>
+    run('finish-new', async () => {
+      await invoke<ProfileSummary>('complete_new_account_login');
+      setNewAccountName('尼区');
+      setNewAccountNotes('');
+      setNewAccountNode('');
+      return '新号已保存并绑定节点';
     });
 
   const switchTo = (id: string) =>
@@ -528,6 +587,9 @@ function App() {
   };
 
   const canCapture = name.trim().length > 0 && !busy;
+  const canPrepareNewAccount =
+    newAccountName.trim().length > 0 && newAccountNode.length > 0 && !busy && !status?.pending_new_account;
+  const canFinishNewAccount = !!status?.pending_new_account && !busy;
   const usageMax = Math.max(
     usage?.session.totals.total_tokens ?? 0,
     usage?.weekly.totals.total_tokens ?? 0,
@@ -662,6 +724,69 @@ function App() {
             {busy === 'capture' ? <Loader2 className="spin" /> : <FileKey />}
             保存快照
           </button>
+        </div>
+
+        <div className="panel onboarding-panel">
+          <div className="panel-title">
+            <UserRound />
+            <span>一键新号</span>
+          </div>
+          {status?.pending_new_account ? (
+            <div className="pending-account">
+              <div>
+                <span>待完成</span>
+                <strong>{status.pending_new_account.name}</strong>
+              </div>
+              <div>
+                <span>节点</span>
+                <strong>{status.pending_new_account.node}</strong>
+              </div>
+              <p>在刚打开的 Claude 窗口完成 OAuth 登录后，点下面保存成正式账号。</p>
+              <button className="primary wide" onClick={finishNewAccount} disabled={!canFinishNewAccount}>
+                {busy === 'finish-new' ? <Loader2 className="spin" /> : <CheckCircle2 />}
+                登录完成后保存
+              </button>
+            </div>
+          ) : (
+            <>
+              <label>
+                新号名称
+                <input
+                  value={newAccountName}
+                  onChange={(event) => setNewAccountName(event.target.value)}
+                  placeholder="例如 尼区 / Claude 备用号"
+                />
+              </label>
+              <label>
+                绑定节点
+                <select
+                  value={newAccountNode}
+                  onChange={(event) => setNewAccountNode(event.target.value)}
+                  disabled={!!busy || !clashStatus?.nodes.length}
+                >
+                  <option value="">选择新号节点</option>
+                  {clashStatus?.nodes.map((node) => (
+                    <option key={node} value={node}>
+                      {node}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                备注
+                <textarea
+                  value={newAccountNotes}
+                  onChange={(event) => setNewAccountNotes(event.target.value)}
+                  placeholder="套餐、地区、用途，留空也可以"
+                  rows={3}
+                />
+              </label>
+              <button className="primary wide" onClick={prepareNewAccount} disabled={!canPrepareNewAccount}>
+                {busy === 'new-login' ? <Loader2 className="spin" /> : <ShieldAlert />}
+                准备并打开登录
+              </button>
+            </>
+          )}
         </div>
 
         <div className="panel network-panel">

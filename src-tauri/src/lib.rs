@@ -118,6 +118,8 @@ fn default_telemetry_mode() -> TelemetryMode {
 struct Store {
     profiles: Vec<StoredProfile>,
     current_profile_id: Option<String>,
+    #[serde(default)]
+    pending_new_account: Option<PendingNewAccount>,
     // 缺省 = DisableTelemetry：老 store 没这个字段、新装都默认开启去关联。
     #[serde(default = "default_telemetry_mode")]
     telemetry_mode: TelemetryMode,
@@ -130,9 +132,20 @@ impl Default for Store {
         Store {
             profiles: Vec::new(),
             current_profile_id: None,
+            pending_new_account: None,
             telemetry_mode: default_telemetry_mode(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingNewAccount {
+    id: String,
+    name: String,
+    notes: Option<String>,
+    group: String,
+    node: String,
+    created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,6 +177,7 @@ struct ClaudeStatus {
     profile_count: usize,
     current_profile_id: Option<String>,
     current_profile_name: Option<String>,
+    pending_new_account: Option<PendingNewAccount>,
     // 当前遥测去关联模式（"default"/"disableTelemetry"/"essentialOnly"）。
     telemetry_mode: TelemetryMode,
     warnings: Vec<String>,
@@ -199,6 +213,14 @@ struct SwitchResult {
     clash: Option<ClashSwitchResult>,
     restart_hint: String,
     // 非阻断告警：例如身份不匹配跳过回写、Claude Code 仍在运行需重启等。
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PrepareNewAccountResult {
+    pending: PendingNewAccount,
+    backup: BackupResult,
+    clash: ClashSwitchResult,
     warnings: Vec<String>,
 }
 
@@ -1842,6 +1864,20 @@ fn clear_keychain_password() -> Result<(), String> {
     Ok(())
 }
 
+fn clear_legacy_keychain_password() -> Result<(), String> {
+    loop {
+        let output = Command::new("security")
+            .args(["delete-generic-password", "-a", LEGACY_KEYCHAIN_ACCOUNT])
+            .args(["-s", KEYCHAIN_SERVICE])
+            .output()
+            .map_err(|e| format!("清理旧 Keychain 失败: {e}"))?;
+        if !output.status.success() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 /// 把账号材料的某一处「写回」到 before 快照里的原值：
 /// 有原值就写回去，原本不存在就删掉文件。统一给回滚用，避免回滚时把文件写成空 JSON。
 fn restore_json_file(path: PathBuf, original: Option<&Value>) -> Result<(), String> {
@@ -2408,6 +2444,99 @@ fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
     write_json_pretty(path, &settings)
 }
 
+fn scrub_auth_from_settings(settings: Option<Value>) -> Option<Value> {
+    let mut settings = settings.unwrap_or_else(|| json!({}));
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    if let Some(obj) = settings.as_object_mut() {
+        obj.remove("apiKeyHelper");
+        if let Some(env) = obj.get_mut("env").and_then(|value| value.as_object_mut()) {
+            for key in AUTH_ENV_KEYS {
+                env.remove(*key);
+            }
+        }
+        let env_empty = obj
+            .get("env")
+            .and_then(|value| value.as_object())
+            .map(|env| env.is_empty())
+            .unwrap_or(false);
+        if env_empty {
+            obj.remove("env");
+        }
+        if obj.is_empty() {
+            return None;
+        }
+    }
+    Some(settings)
+}
+
+fn remove_legacy_credentials_file() -> Result<(), String> {
+    let path = legacy_credentials_path()?;
+    if path.exists() {
+        fs::remove_file(&path)
+            .map_err(|e| format!("删除 ~/.claude/.credentials.json 失败: {e}"))?;
+    }
+    Ok(())
+}
+
+fn clean_live_account_for_new_login(
+    settings_json: Option<Value>,
+    rollback_from: &BackupSnapshot,
+) -> Result<(), String> {
+    let scrubbed_settings = scrub_auth_from_settings(settings_json);
+    apply_account_material(
+        WriteMode::FullReplace,
+        None,
+        scrubbed_settings.as_ref(),
+        None,
+        rollback_from,
+    )?;
+    clear_legacy_keychain_password()?;
+    remove_legacy_credentials_file()?;
+    Ok(())
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn open_clean_claude_login_terminal() -> Result<(), String> {
+    let mut parts = vec![
+        "cd ~".to_string(),
+        "env".to_string(),
+        "-u ANTHROPIC_API_KEY".to_string(),
+        "-u ANTHROPIC_AUTH_TOKEN".to_string(),
+        "-u CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "-u CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR".to_string(),
+        "-u CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR".to_string(),
+    ];
+    if let Some(proxy) = detect_clash_runtime_config().proxy {
+        parts.push(format!("HTTPS_PROXY={}", shell_single_quote(&proxy)));
+        parts.push(format!("HTTP_PROXY={}", shell_single_quote(&proxy)));
+        parts.push(format!("ALL_PROXY={}", shell_single_quote(&proxy)));
+    }
+    parts.push("claude".to_string());
+    let terminal_command = parts.join(" ");
+    let script = format!(
+        "tell application \"Terminal\"\nactivate\ndo script {}\nend tell",
+        shell_single_quote(&terminal_command)
+    );
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|e| format!("打开 Terminal 登录窗口失败: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "打开 Terminal 登录窗口失败: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
 #[tauri::command]
 fn get_status() -> Result<ClaudeStatus, String> {
     ensure_app_dirs()?;
@@ -2456,7 +2585,10 @@ fn get_status() -> Result<ClaudeStatus, String> {
 
     let current_profile_id_ref = store.current_profile_id.as_deref();
     let session_isolation = session_isolation_status(current_profile_id_ref)?;
-    if store.current_profile_id.is_some() && !session_isolation.enabled {
+    if store.current_profile_id.is_some()
+        && store.pending_new_account.is_none()
+        && !session_isolation.enabled
+    {
         warnings.push(
             "Claude session 隔离未激活；切换一次当前账号或重新捕获账号后会自动接管 ~/.claude/projects"
                 .to_string(),
@@ -2481,6 +2613,7 @@ fn get_status() -> Result<ClaudeStatus, String> {
             .as_deref()
             .and_then(|id| store.profiles.iter().find(|profile| profile.id == id))
             .map(|profile| profile.name.clone()),
+        pending_new_account: store.pending_new_account.clone(),
         current_profile_id: store.current_profile_id,
         telemetry_mode: store.telemetry_mode,
         warnings,
@@ -2577,6 +2710,132 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
     adopt_live_sessions_for_profile(&profile_id)?;
     activate_profile_sessions(&profile_id)?;
     store.current_profile_id = Some(profile_id);
+    store.profiles.push(profile);
+    save_store(&store)?;
+    Ok(summary)
+}
+
+#[tauri::command]
+fn prepare_new_account_login(
+    name: String,
+    notes: Option<String>,
+    node: String,
+) -> Result<PrepareNewAccountResult, String> {
+    let clean_name = name.trim();
+    if clean_name.is_empty() {
+        return Err("新账号名称不能为空".to_string());
+    }
+    let clean_node = node.trim();
+    if clean_node.is_empty() {
+        return Err("必须选择新账号绑定的 Clash 节点".to_string());
+    }
+
+    let mut store = load_store()?;
+    let mut warnings = Vec::new();
+    if store.pending_new_account.is_some() {
+        return Err("已有待完成的新号登录流程，请先完成保存或切回旧账号重新开始".to_string());
+    }
+    if claude_code_running() {
+        return Err(
+            "检测到 Claude Code 仍在运行。请先退出当前 Claude Code 会话，再准备新号登录。"
+                .to_string(),
+        );
+    }
+
+    let backup = create_backup_with_label("before-new-account-login")?;
+    warnings.extend(refresh_current_profile_snapshot(
+        &mut store,
+        "__new_account_login__",
+    ));
+    if let Some(current_id) = store.current_profile_id.as_deref() {
+        warnings.extend(adopt_live_sessions_for_profile(current_id)?);
+    }
+
+    let (_, settings_json, _) = current_snapshot()?;
+    let rollback_from = load_backup_snapshot(&PathBuf::from(&backup.path))?;
+    let clash = switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
+
+    let pending = PendingNewAccount {
+        id: format!("pending-{}", Uuid::new_v4()),
+        name: clean_name.to_string(),
+        notes,
+        group: DEFAULT_CLASH_GROUP.to_string(),
+        node: clean_node.to_string(),
+        created_at: Utc::now(),
+    };
+    clean_live_account_for_new_login(settings_json, &rollback_from)?;
+    if let Err(e) = apply_privacy_env_to_settings(store.telemetry_mode) {
+        warnings.push(format!(
+            "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
+        ));
+    }
+    warnings.extend(activate_profile_sessions(&pending.id)?);
+    store.pending_new_account = Some(pending.clone());
+    save_store(&store)?;
+    if let Err(e) = open_clean_claude_login_terminal() {
+        warnings.push(e);
+    }
+    Ok(PrepareNewAccountResult {
+        pending,
+        backup,
+        clash,
+        warnings,
+    })
+}
+
+#[tauri::command]
+fn complete_new_account_login() -> Result<ProfileSummary, String> {
+    let mut store = load_store()?;
+    let pending = store
+        .pending_new_account
+        .clone()
+        .ok_or_else(|| "没有待完成的新号登录流程".to_string())?;
+    let (claude_json, settings_json, keychain_password) = current_snapshot()?;
+    let claude_json = claude_json
+        .ok_or_else(|| "当前没有 ~/.claude.json，请先在刚打开的 Claude 窗口完成登录".to_string())?;
+    let keychain_password = keychain_password.ok_or_else(|| {
+        "当前没有 Keychain Claude Code-credentials，请先完成 Claude OAuth 登录".to_string()
+    })?;
+
+    if store
+        .profiles
+        .iter()
+        .any(|profile| profile.id == pending.id)
+    {
+        return Err("这个待完成账号已经保存过".to_string());
+    }
+    let now = Utc::now();
+    let profile = StoredProfile {
+        id: pending.id.clone(),
+        name: pending.name.clone(),
+        notes: pending.notes.clone(),
+        created_at: pending.created_at,
+        updated_at: now,
+        last_switched_at: Some(now),
+        meta: extract_meta(Some(&claude_json), Some(&keychain_password)),
+        claude_json,
+        settings_json,
+        keychain_password: Some(keychain_password),
+        clash: Some(ProfileClashBinding {
+            enabled: true,
+            group: pending.group.clone(),
+            node: pending.node.clone(),
+        }),
+    };
+    let summary = ProfileSummary {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        notes: profile.notes.clone(),
+        created_at: profile.created_at,
+        updated_at: profile.updated_at,
+        last_switched_at: profile.last_switched_at,
+        meta: profile.meta.clone(),
+        clash: profile.clash.clone(),
+        is_current: true,
+    };
+    activate_profile_sessions(&profile.id)?;
+    store.current_profile_id = Some(profile.id.clone());
+    store.pending_new_account = None;
     store.profiles.push(profile);
     save_store(&store)?;
     Ok(summary)
@@ -3018,6 +3277,8 @@ pub fn run() {
             set_telemetry_mode,
             list_profiles,
             capture_current_profile,
+            prepare_new_account_login,
+            complete_new_account_login,
             switch_profile,
             get_clash_status,
             get_claude_usage,

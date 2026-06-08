@@ -371,6 +371,46 @@ select:focus {
   margin-top: 18px;
 }
 
+.onboarding-panel .primary {
+  margin-top: 18px;
+}
+
+.pending-account {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.pending-account div {
+  display: grid;
+  gap: 5px;
+  min-height: 58px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #eee7d8;
+}
+
+.pending-account span {
+  color: #756c5b;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.pending-account strong {
+  overflow: hidden;
+  color: #24251f;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pending-account p {
+  margin: 0;
+  color: #756c5b;
+  font-size: 13px;
+  font-weight: 760;
+  line-height: 1.45;
+}
+
 .network-panel,
 .files-panel,
 .usage-panel {
