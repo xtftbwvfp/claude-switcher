@@ -1,0 +1,303 @@
+html.is-claude-tray-popup,
+body.is-claude-tray-popup,
+.is-claude-tray-popup #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  background: transparent !important;
+}
+
+.claude-tray-popup {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  width: 100%;
+  height: 100vh;
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 17px 18px;
+  color: #efeaf7;
+  background:
+    radial-gradient(circle at 88% 9%, rgba(63, 211, 173, 0.16), transparent 30%),
+    linear-gradient(160deg, #23134b 0%, #2c1757 44%, #1b113d 100%);
+  border: 1px solid rgba(148, 122, 219, 0.28);
+  border-radius: 16px;
+  box-shadow: 0 22px 70px rgba(23, 14, 48, 0.42);
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  user-select: none;
+}
+
+.ctp-header,
+.ctp-title,
+.ctp-account,
+.ctp-card-header,
+.ctp-actions,
+.ctp-meta {
+  display: flex;
+  align-items: center;
+}
+
+.ctp-header {
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.ctp-title {
+  gap: 11px;
+  min-width: 0;
+}
+
+.ctp-logo {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  color: #fff9d7;
+  background: linear-gradient(135deg, #7a5be7, #a775ef);
+  box-shadow: 0 8px 24px rgba(122, 91, 231, 0.42);
+  font-size: 19px;
+  font-weight: 900;
+}
+
+.ctp-name {
+  color: #fff;
+  font-size: 18px;
+  font-weight: 850;
+  line-height: 1.05;
+  letter-spacing: 0;
+}
+
+.ctp-subtitle {
+  margin-top: 4px;
+  color: rgba(239, 234, 247, 0.46);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.ctp-badge {
+  flex: 0 0 auto;
+  padding: 6px 11px;
+  border: 1px solid rgba(248, 113, 113, 0.3);
+  border-radius: 999px;
+  color: #f87171;
+  background: rgba(248, 113, 113, 0.08);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.ctp-badge.running {
+  color: #35dfaa;
+  background: rgba(53, 223, 170, 0.1);
+  border-color: rgba(53, 223, 170, 0.32);
+}
+
+.ctp-account {
+  gap: 8px;
+  min-width: 0;
+  margin-top: -2px;
+  color: rgba(239, 234, 247, 0.62);
+  font-size: 13px;
+  font-weight: 720;
+}
+
+.ctp-account > :first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctp-plan,
+.ctp-auth {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 5px;
+  color: #c7b5ff;
+  background: rgba(143, 103, 236, 0.2);
+  font-size: 10px;
+  font-weight: 850;
+}
+
+.ctp-auth {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.16);
+}
+
+.ctp-auth.ok {
+  color: #35dfaa;
+  background: rgba(53, 223, 170, 0.14);
+}
+
+.ctp-cards {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.ctp-card {
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 11px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.ctp-card-header {
+  gap: 6px;
+  margin-bottom: 9px;
+  color: rgba(239, 234, 247, 0.45);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+}
+
+.ctp-card-icon {
+  color: #ffd15d;
+  font-size: 13px;
+}
+
+.ctp-status {
+  margin-left: auto;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 8px;
+  font-weight: 950;
+  letter-spacing: 0.6px;
+}
+
+.ctp-status.healthy {
+  color: #35dfaa;
+  background: rgba(53, 223, 170, 0.15);
+}
+
+.ctp-status.warning {
+  color: #facc15;
+  background: rgba(250, 204, 21, 0.15);
+}
+
+.ctp-status.critical {
+  color: #fb7185;
+  background: rgba(251, 113, 133, 0.15);
+}
+
+.ctp-card-value {
+  overflow: hidden;
+  color: #fff;
+  font-size: 35px;
+  font-weight: 900;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctp-unit {
+  margin-left: 1px;
+  color: rgba(239, 234, 247, 0.56);
+  font-size: 16px;
+  font-weight: 650;
+}
+
+.ctp-remaining {
+  margin-left: 5px;
+  color: rgba(239, 234, 247, 0.38);
+  font-size: 12px;
+  font-weight: 680;
+}
+
+.today-value {
+  color: #ffd15d;
+  font-size: 28px;
+}
+
+.token-value {
+  color: #35dfaa;
+  font-size: 28px;
+}
+
+.ctp-progress {
+  height: 4px;
+  margin: 10px 0 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.075);
+}
+
+.ctp-progress-bar {
+  height: 100%;
+  border-radius: inherit;
+  transition: width 0.35s ease;
+}
+
+.ctp-progress-bar.healthy {
+  background: linear-gradient(90deg, #8d6df1, #35dfaa);
+}
+
+.ctp-progress-bar.warning {
+  background: linear-gradient(90deg, #facc15, #fb923c);
+}
+
+.ctp-progress-bar.critical {
+  background: #fb7185;
+}
+
+.ctp-reset,
+.ctp-token-detail,
+.ctp-note {
+  color: rgba(239, 234, 247, 0.38);
+  font-size: 10px;
+  font-weight: 720;
+}
+
+.ctp-meta {
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 20px;
+  color: rgba(239, 234, 247, 0.44);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.ctp-meta b {
+  overflow: hidden;
+  max-width: 235px;
+  color: rgba(239, 234, 247, 0.78);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ctp-note {
+  margin-top: -2px;
+}
+
+.ctp-actions {
+  gap: 8px;
+  margin-top: auto;
+}
+
+.ctp-btn {
+  flex: 1;
+  min-height: 38px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 9px;
+  color: rgba(239, 234, 247, 0.7);
+  background: rgba(255, 255, 255, 0.045);
+  font-weight: 850;
+}
+
+.ctp-btn:hover {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ctp-btn.primary {
+  color: #fff;
+  background: linear-gradient(135deg, #7a5be7, #8f67ec);
+  border-color: rgba(143, 103, 236, 0.34);
+}
+
+.ctp-btn:disabled {
+  opacity: 0.45;
+}

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import {
   Archive,
   Activity,
@@ -23,6 +24,18 @@ import {
   Trash2,
   UserRound,
 } from 'lucide-react';
+import { ClaudeTrayPopup } from './components/ClaudeTrayPopup';
+
+const WINDOW_LABEL = (() => {
+  if (new URLSearchParams(window.location.search).get('window') === 'tray-popup') {
+    return 'tray-popup';
+  }
+  try {
+    return getCurrentWebviewWindow().label;
+  } catch {
+    return 'main';
+  }
+})();
 
 interface ProfileMeta {
   email?: string | null;
@@ -307,6 +320,10 @@ function fallbackWindow(label: string): UsageWindow {
 }
 
 function App() {
+  if (WINDOW_LABEL === 'tray-popup') {
+    return <ClaudeTrayPopup />;
+  }
+
   const [status, setStatus] = useState<ClaudeStatus | null>(null);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [usage, setUsage] = useState<ClaudeUsageSnapshot | null>(null);

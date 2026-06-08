@@ -15,7 +15,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration as StdDuration;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
-use tauri::Manager;
+use tauri::{
+    AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
+};
 use uuid::Uuid;
 
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -713,13 +715,77 @@ fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+fn position_tray_popup(
+    window: &WebviewWindow,
+    tray_position: PhysicalPosition<f64>,
+) -> Result<(), String> {
+    let popup_width = 390.0;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let x = (tray_position.x - popup_width * scale / 2.0).max(0.0) as i32;
+    let y = (tray_position.y + 4.0) as i32;
+    window
+        .set_position(Position::Physical(PhysicalPosition::new(x, y)))
+        .map_err(|e| format!("定位菜单栏弹窗失败: {e}"))
+}
+
+fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) {
+    let label = "tray-popup";
+    if let Some(window) = app.get_webview_window(label) {
+        if window.is_visible().unwrap_or(false) {
+            let _ = window.hide();
+            return;
+        }
+        let _ = position_tray_popup(&window, tray_position);
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+
+    let url = WebviewUrl::App("index.html".into());
+    match WebviewWindowBuilder::new(app, label, url)
+        .title("Claude Switcher Status")
+        .inner_size(390.0, 540.0)
+        .resizable(false)
+        .decorations(false)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .visible(false)
+        .build()
+    {
+        Ok(window) => {
+            let window_clone = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    let _ = window_clone.hide();
+                }
+            });
+            let _ = position_tray_popup(&window, tray_position);
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        Err(error) => eprintln!("[claude-switcher] 创建菜单栏弹窗失败: {error}"),
+    }
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+    if let Some(popup) = app.get_webview_window("tray-popup") {
+        let _ = popup.hide();
+    }
+}
+
 fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
     let _ = refresh_tray_status(&app_handle);
 
     let refresh_handle = app_handle.clone();
     thread::spawn(move || loop {
-        thread::sleep(StdDuration::from_secs(300));
+        thread::sleep(StdDuration::from_secs(60));
         let _ = refresh_tray_status(&refresh_handle);
     });
 
@@ -727,14 +793,11 @@ fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
+            position,
             ..
         } = event
         {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            toggle_tray_popup(app, position);
         }
     });
 
@@ -2362,6 +2425,11 @@ fn inspect_local_files() -> Result<BTreeMap<String, bool>, String> {
     Ok(map)
 }
 
+#[tauri::command]
+fn show_main_window_cmd(app: AppHandle) {
+    show_main_window(&app);
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -2389,6 +2457,7 @@ pub fn run() {
             restore_backup,
             open_data_dir,
             inspect_local_files,
+            show_main_window_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude Switcher");
