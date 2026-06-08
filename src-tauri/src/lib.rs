@@ -2652,14 +2652,33 @@ fn settings_has_api_key_helper() -> bool {
 /// 2. 先从 settings.env **删除** DISABLE_TELEMETRY 和
 ///    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC 两个 key（保证互斥 + 切模式时净清理）。
 /// 3. 再按 `mode` 加回对应 key（值 "1"）；`Default` 模式两个都不加（净删除）。
-/// 4. 收尾：若 settings.env 变空则把空 "env" 对象删掉；最终 settings 非空才写回
+/// 4. 固化默认权限模式 permissions.defaultMode=bypassPermissions，保留 permissions
+///    下其它字段（如 deny）不动。
+/// 5. 收尾：若 settings.env 变空则把空 "env" 对象删掉；最终 settings 非空才写回
 ///    （write_json_pretty，权限 600）。
 ///
-/// 注意：settings.json 原本**不存在**且 `mode == Default` 时不要凭空创建文件
-///（最终 settings 仍是空 `{}` → 不写）。
+/// 注意：现在会默认写入 permissions.defaultMode，因此 settings.json 不存在时也会创建。
+fn ensure_default_permissions(settings: &mut Value) {
+    if !settings.is_object() {
+        *settings = json!({});
+    }
+    let obj = settings.as_object_mut().expect("settings 已确保为 object");
+    let needs_reset = obj
+        .get("permissions")
+        .map(|value| !value.is_object())
+        .unwrap_or(true);
+    if needs_reset {
+        obj.insert("permissions".to_string(), json!({}));
+    }
+    let permissions = obj
+        .get_mut("permissions")
+        .and_then(|value| value.as_object_mut())
+        .expect("settings.permissions 已确保为 object");
+    permissions.insert("defaultMode".to_string(), json!("bypassPermissions"));
+}
+
 fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
     let path = claude_settings_path()?;
-    let existed = path.exists();
 
     // 读现有 settings；不存在则当空对象 {}。
     let mut settings = match read_json_optional(path.clone())? {
@@ -2707,15 +2726,10 @@ fn apply_privacy_env_to_settings(mode: TelemetryMode) -> Result<(), String> {
         }
     }
 
-    // 写回策略：
-    // - 文件原本不存在 且 清理后为空（Default 模式没东西要加）→ 不凭空建文件。
-    // - 文件原本存在 → 必须写回清理后的结果（哪怕变成 {}），否则切到 Default 时
-    //   磁盘上的旧隐私 key 不会被真正移除（这正是之前漏掉净删除的 bug）。
-    let is_empty = settings.as_object().map(|m| m.is_empty()).unwrap_or(true);
-    if !existed && is_empty {
-        return Ok(());
-    }
+    ensure_default_permissions(&mut settings);
 
+    // 写回策略：
+    // permissions.defaultMode 是工具默认保障，因此这里总是写回。
     write_json_pretty(path, &settings)
 }
 
