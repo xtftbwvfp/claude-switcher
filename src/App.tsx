@@ -477,7 +477,7 @@ function App() {
   const prepareNewAccount = () => {
     if (
       !window.confirm(
-        `准备新号登录「${newAccountName.trim()}」？\n\n工具会先保存当前账号状态，把 Auto-Claude 切到「${newAccountNode}」，清空当前 Claude OAuth，并打开一个干净的 Claude 登录窗口。`,
+        `准备新号登录「${newAccountName.trim()}」？\n\n工具会先结束所有 Claude Code CLI 进程，保存当前账号状态，把 Auto-Claude 切到「${newAccountNode}」，清空当前 Claude OAuth，并打开一个干净的 Claude 登录窗口。`,
       )
     )
       return;

@@ -2327,31 +2327,96 @@ fn prune_backups(keep: usize) {
 
 /// H2：best-effort 检测 Claude Code CLI 是否在运行（仅用于提示重启，非阻断）。
 /// 尽量精确匹配 Claude Code CLI 进程，避免把本工具（claude-switcher）自身误判进来。
-fn claude_code_running() -> bool {
+fn claude_code_processes() -> Vec<(u32, String)> {
     // pgrep -f -l 输出 "pid command"，便于过滤掉 claude-switcher 自身。
     let Ok(output) = Command::new("pgrep").args(["-f", "-l", "claude"]).output() else {
-        return false;
+        return Vec::new();
     };
     if !output.status.success() {
-        return false;
+        return Vec::new();
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().any(|line| {
-        let lower = line.to_ascii_lowercase();
-        // 命中 Claude Code CLI（"claude" 可执行 / @anthropic-ai/claude-code），
-        // 但排除本工具自身与 macOS 桌面版 Claude.app 之类的无关进程。
-        let is_self = lower.contains("claude-switcher") || lower.contains("claude_switcher");
-        if is_self {
-            return false;
+    text.lines()
+        .filter_map(|line| {
+            let (pid_raw, command) = line.split_once(char::is_whitespace)?;
+            let pid = pid_raw.parse::<u32>().ok()?;
+            let command = command.trim().to_string();
+            let lower = command.to_ascii_lowercase();
+            // 命中 Claude Code CLI（"claude" 可执行 / @anthropic-ai/claude-code），
+            // 但排除本工具自身与 macOS 桌面版 Claude.app 之类的无关进程。
+            let is_self = lower.contains("claude-switcher") || lower.contains("claude_switcher");
+            if is_self {
+                return None;
+            }
+            let is_claude_code = lower.contains("claude-code")
+                || lower.contains("claude code")
+                || lower.split_whitespace().any(|tok| {
+                    let base = tok.rsplit('/').next().unwrap_or(tok);
+                    base == "claude"
+                });
+            is_claude_code.then_some((pid, command))
+        })
+        .collect()
+}
+
+fn claude_code_running() -> bool {
+    !claude_code_processes().is_empty()
+}
+
+fn kill_claude_code_processes() -> Result<Vec<String>, String> {
+    let processes = claude_code_processes();
+    if processes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pids = processes
+        .iter()
+        .map(|(pid, _)| pid.to_string())
+        .collect::<Vec<_>>();
+    let _ = Command::new("kill").args(&pids).output();
+    thread::sleep(StdDuration::from_millis(600));
+
+    let remaining = claude_code_processes();
+    if !remaining.is_empty() {
+        let remaining_pids = remaining
+            .iter()
+            .map(|(pid, _)| pid.to_string())
+            .collect::<Vec<_>>();
+        let output = Command::new("kill")
+            .arg("-9")
+            .args(&remaining_pids)
+            .output()
+            .map_err(|e| format!("强制结束 Claude Code 进程失败: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "强制结束 Claude Code 进程失败: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
-        // 精确一点：CLI 入口通常是 "claude" 命令或 claude-code 包路径。
-        lower.contains("claude-code")
-            || lower.contains("claude code")
-            || lower.split_whitespace().any(|tok| {
-                let base = tok.rsplit('/').next().unwrap_or(tok);
-                base == "claude"
-            })
-    })
+        thread::sleep(StdDuration::from_millis(300));
+    }
+
+    let still_running = claude_code_processes();
+    if !still_running.is_empty() {
+        return Err(format!(
+            "仍有 Claude Code 进程未退出: {}",
+            still_running
+                .iter()
+                .map(|(pid, command)| format!("{pid} {command}"))
+                .collect::<Vec<_>>()
+                .join("；")
+        ));
+    }
+
+    Ok(vec![format!(
+        "已结束 {} 个 Claude Code 进程：{}",
+        processes.len(),
+        processes
+            .iter()
+            .map(|(pid, _)| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )])
 }
 
 /// N3：检测 ~/.claude/settings.json 是否含 apiKeyHelper 字段（会覆盖 OAuth，使切号失效）。
@@ -2735,12 +2800,7 @@ fn prepare_new_account_login(
     if store.pending_new_account.is_some() {
         return Err("已有待完成的新号登录流程，请先完成保存或切回旧账号重新开始".to_string());
     }
-    if claude_code_running() {
-        return Err(
-            "检测到 Claude Code 仍在运行。请先退出当前 Claude Code 会话，再准备新号登录。"
-                .to_string(),
-        );
-    }
+    warnings.extend(kill_claude_code_processes()?);
 
     let backup = create_backup_with_label("before-new-account-login")?;
     warnings.extend(refresh_current_profile_snapshot(
