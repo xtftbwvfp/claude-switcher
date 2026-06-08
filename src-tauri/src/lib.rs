@@ -288,6 +288,7 @@ struct CachedOauthUsage {
 }
 
 static OAUTH_USAGE_CACHE: OnceLock<Mutex<Option<CachedOauthUsage>>> = OnceLock::new();
+static OAUTH_PROFILE_CACHE: OnceLock<Mutex<Option<CachedOauthUsage>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct ClashRuntimeConfig {
@@ -572,6 +573,11 @@ fn claude_oauth_api(path: &str, access_token: &str, max_time_secs: u64) -> Resul
         .arg("-sS")
         .arg("--max-time")
         .arg(max_time_secs.to_string())
+        .arg("--retry")
+        .arg("2")
+        .arg("--retry-delay")
+        .arg("1")
+        .arg("--retry-all-errors")
         .arg("--config")
         .arg("-")
         .stdin(Stdio::piped())
@@ -602,8 +608,30 @@ fn claude_oauth_api(path: &str, access_token: &str, max_time_secs: u64) -> Resul
 }
 
 fn cached_oauth_usage(access_token: &str) -> Result<Value, String> {
-    let cache = OAUTH_USAGE_CACHE.get_or_init(|| Mutex::new(None));
-    match claude_oauth_api("/api/oauth/usage", access_token, 8) {
+    cached_oauth_endpoint(
+        OAUTH_USAGE_CACHE.get_or_init(|| Mutex::new(None)),
+        "/api/oauth/usage",
+        access_token,
+        Duration::minutes(10),
+    )
+}
+
+fn cached_oauth_profile(access_token: &str) -> Result<Value, String> {
+    cached_oauth_endpoint(
+        OAUTH_PROFILE_CACHE.get_or_init(|| Mutex::new(None)),
+        "/api/oauth/profile",
+        access_token,
+        Duration::hours(6),
+    )
+}
+
+fn cached_oauth_endpoint(
+    cache: &Mutex<Option<CachedOauthUsage>>,
+    path: &str,
+    access_token: &str,
+    ttl: Duration,
+) -> Result<Value, String> {
+    match claude_oauth_api(path, access_token, 12) {
         Ok(value) => {
             if let Ok(mut guard) = cache.lock() {
                 *guard = Some(CachedOauthUsage {
@@ -618,7 +646,7 @@ fn cached_oauth_usage(access_token: &str) -> Result<Value, String> {
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .filter(|cached| Utc::now() - cached.fetched_at < Duration::minutes(10))
+                .filter(|cached| Utc::now() - cached.fetched_at < ttl)
                 .map(|cached| cached.value);
             cached.ok_or(error)
         }
@@ -1131,7 +1159,7 @@ fn apply_oauth_profile(
         return Ok(());
     };
     let access_token = oauth_access_token_from_raw(raw)?;
-    let value = claude_oauth_api("/api/oauth/profile", &access_token, 8)?;
+    let value = cached_oauth_profile(&access_token)?;
     if let Some(account) = value.get("account") {
         meta.email = string_field(account, &["email"])
             .map(ToOwned::to_owned)
@@ -2216,11 +2244,7 @@ fn get_status() -> Result<ClaudeStatus, String> {
     let mut meta = extract_meta(claude_json.as_ref(), keychain.as_deref());
     fill_meta_from_saved_profile(&mut meta, &store);
     let mut warnings = Vec::new();
-    if let Err(error) = apply_oauth_profile(&mut meta, keychain.as_deref()) {
-        warnings.push(format!(
-            "官方 Claude OAuth profile 读取失败，已回退本地账号信息: {error}"
-        ));
-    }
+    let _ = apply_oauth_profile(&mut meta, keychain.as_deref());
 
     if claude_json.is_none() {
         warnings.push("没有发现 ~/.claude.json，可能尚未登录 Claude Code".to_string());
